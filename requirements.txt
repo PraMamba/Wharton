@@ -1,0 +1,11 @@
+pandas
+plotly
+chardet
+py7zr
+openpyxl
+jinja2
+numpy
+pypdf
+matplotlib
+scipy
+scikit-learn

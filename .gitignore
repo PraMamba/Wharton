@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Logs
+*.log
+analyzer.log
+
+# LaTeX build artifacts
+report/report.aux
+report/report.log
+report/report.out
+report/report.toc
+report/report.pdf
+
+# Original zip download
+drive-download-20260205T132825Z-1-001.zip
+
+# OS files
+Thumbs.db
+.DS_Store

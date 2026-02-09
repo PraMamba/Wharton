@@ -1,0 +1,29 @@
+Filesystem writes are blocked in this environment, so I can’t create `output/codex_review2.txt` directly. Contents to put in `output/codex_review2.txt`:
+
+```text
+1) DATA (per-60 math)
+Yes. If `toi` is in seconds, per-60 rates should scale by 3600 seconds. In `phase1_submit.py`, `xgd_per60 = (xgf - xga) / (toi / 3600)` is equivalent to `(xgf - xga) * 3600 / toi`, which is correct. Same approach is used for line xG/60.
+
+2) GOALIE (GSAx = (xGA - GA)/games)
+Defensible as a team-level “goals saved above expected per game” proxy (positive means fewer goals allowed than expected given shot quality). Two caveats:
+- It’s not pure goalie skill: it also includes finishing luck, xG model error, and anything xGA doesn’t capture.
+- Per-60 is more standard than per-game if OT minutes differ meaningfully: (xGA - GA) / (toi/3600).
+
+3) SHOT QUALITY (xG/shot)
+Yes, xGF/SF is a common “average shot quality” metric. It’s fine as descriptive context, but can be noisy and should be interpreted alongside volume (shots/60, xG/60), since teams can trade off volume vs quality.
+
+4) PENALTIES (PIM/game; (drawn-taken)/game)
+Meaningful but noisy. PIM/GP is a rough discipline/style measure; penalty differential is often more informative since it relates to net special-teams opportunity. Caveats: penalty minutes aren’t the same as PP time (coincidental minors/majors), and both metrics are referee/style dependent.
+
+5) PREDICTION (adding goalie/shot-quality/penalty features gave 0 accuracy gain; kept descriptive only)
+Right call if they don’t improve leakage-safe out-of-fold performance. Two notes:
+- Check log-loss/Brier/calibration too (accuracy can be flat while probability quality changes).
+- If re-testing multi-feature models, recompute team aggregates within each CV fold (to avoid leakage).
+
+6) CALIBRATION (overconfidence above ~70%)
+Yes, mention it as a limitation since you output probabilities. Your OOF calibration already shows high-end overconfidence (e.g., ~0.75 predicted vs ~0.70 observed). Optional: apply a simple post-hoc calibration (temperature scaling / isotonic) or avoid calling the raw logistic “calibrated” without that step.
+
+7) OVERALL (HS competition) + single most impactful improvement
+Methodology: 8.5/10 for HS (strong pipeline, honest fold-refit BT CV, baseline, and probability metrics).
+Most impactful improvement: add a lightweight post-hoc probability calibration (temperature scaling / isotonic using OOF preds) and report remaining miscalibration at the high-probability end.
+```
