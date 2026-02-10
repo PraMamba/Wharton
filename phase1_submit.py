@@ -141,15 +141,18 @@ def build_team_stats(game):
     stats["win_pct"] = stats["wins"] / stats["games"]
     stats["gd_pg"] = (stats["gf"] - stats["ga"]) / stats["games"]
     # Data dictionary: toi is seconds. per60 = per 60 minutes = per 3600 seconds.
-    stats["xgd_per60"] = (stats["xgf"] - stats["xga"]) / (stats["toi"] / 3600)
-    stats["xg_share"] = stats["xgf"] / (stats["xgf"] + stats["xga"])
-    stats["save_pct"] = 1 - (stats["ga"] / stats["sa"])
-    stats["shooting_pct"] = stats["gf"] / stats["sf"]
+    # Protect against division by zero throughout
+    toi_hours = stats["toi"] / 3600
+    stats["xgd_per60"] = np.where(toi_hours > 0, (stats["xgf"] - stats["xga"]) / toi_hours, 0)
+    total_xg = stats["xgf"] + stats["xga"]
+    stats["xg_share"] = np.where(total_xg > 0, stats["xgf"] / total_xg, 0.5)
+    stats["save_pct"] = np.where(stats["sa"] > 0, 1 - (stats["ga"] / stats["sa"]), 0)
+    stats["shooting_pct"] = np.where(stats["sf"] > 0, stats["gf"] / stats["sf"], 0)
     stats["pdo"] = stats["shooting_pct"] + stats["save_pct"]
     # Goaltending: GSAx/game = (xGA - GA) / games. Positive = goalie saves more than expected.
     stats["gsax_pg"] = (stats["xga"] - stats["ga"]) / stats["games"]
     # Shot quality: xG per shot (offensive chance quality).
-    stats["xg_per_shot"] = stats["xgf"] / stats["sf"]
+    stats["xg_per_shot"] = np.where(stats["sf"] > 0, stats["xgf"] / stats["sf"], 0)
     # Discipline: penalty minutes per game, penalty differential per game.
     stats["pim_pg"] = stats["pm_taken"] / stats["games"]
     stats["pen_diff_pg"] = (stats["pm_drawn"] - stats["pm_taken"]) / stats["games"]
@@ -300,11 +303,13 @@ def build_line_disparity(df):
     # Defensive difficulty adjustment
     dq = es.groupby("opp_def").agg(txg=("xgf","sum"), tt=("toi","sum"))
     # toi is seconds; scale to per-60-minutes (3600 seconds).
-    dq["xga60"] = (dq["txg"] / dq["tt"]) * 3600
-    avg = es["xgf"].sum() / es["toi"].sum() * 3600
-    dq["diff"] = dq["xga60"] / avg
+    # Protect against division by zero
+    dq["xga60"] = np.where(dq["tt"] > 0, (dq["txg"] / dq["tt"]) * 3600, 0)
+    total_toi = es["toi"].sum()
+    avg = (es["xgf"].sum() / total_toi * 3600) if total_toi > 0 else 1.0
+    dq["diff"] = np.where(avg > 0, dq["xga60"] / avg, 1.0)
     es = es.merge(dq[["diff"]], left_on="opp_def", right_index=True, how="left")
-    es["diff"] = es["diff"].fillna(1.0)
+    es["diff"] = es["diff"].fillna(1.0).replace(0, 1.0)  # Ensure no zero divisors
     es["adj_xgf"] = es["xgf"] / es["diff"]
 
     ls = es.groupby(["team","line"]).agg(rxg=("xgf","sum"), axg=("adj_xgf","sum"), t=("toi","sum"))
@@ -313,11 +318,14 @@ def build_line_disparity(df):
 
     pr = ls["raw60"].unstack("line")
     pa = ls["adj60"].unstack("line")
+    # Protect against division by zero: use np.where to avoid inf/NaN
+    raw_second = pr["second_off"].replace(0, np.nan)
+    adj_second = pa["second_off"].replace(0, np.nan)
     disp = pd.DataFrame({
         "first_raw": pr["first_off"], "second_raw": pr["second_off"],
-        "raw_ratio": pr["first_off"] / pr["second_off"],
+        "raw_ratio": pr["first_off"] / raw_second,
         "first_adj": pa["first_off"], "second_adj": pa["second_off"],
-        "adj_ratio": pa["first_off"] / pa["second_off"],
+        "adj_ratio": pa["first_off"] / adj_second,
     }).reset_index().sort_values("adj_ratio", ascending=False)
     return disp
 
@@ -392,6 +400,7 @@ def create_full_dashboard(rankings, disparity, matchups, cal_data, output_dir):
     ax1 = fig.add_subplot(gs[0, :2])
     x, y = pdf["adj_ratio"].values, pdf["composite"].values
     m = np.isfinite(x) & np.isfinite(y)
+    corr, r2 = 0.0, 0.0
     sc = ax1.scatter(x, y, c=y, cmap="viridis", s=60, edgecolors="white", lw=0.5, zorder=3)
     if m.sum() > 2:
         coef = np.polyfit(x[m], y[m], 1)

@@ -6,7 +6,7 @@ Adds ML challenger models per Codex (GPT-5.3) recommendation:
   - Core model: Bradley-Terry logistic regression (current)
   - Challenger 1: Elastic Net logistic regression (regularized, interpretable)
   - Challenger 2: XGBoost with monotonic constraints (high accuracy)
-  - Challenger 3: Blended ensemble (core + XGBoost)
+  - Challenger 3: Blended ensemble (Elastic Net + XGBoost)
 
 Reports: Accuracy, Log-loss, Brier score, Calibration curves
 Feature importance via permutation importance (model-agnostic)
@@ -118,11 +118,14 @@ def build_team_season_stats(game):
     stats["win_pct"] = stats["wins"] / stats["games"]
     stats["gd_pg"] = (stats["gf"] - stats["ga"]) / stats["games"]
     stats["xgd_pg"] = (stats["xgf"] - stats["xga"]) / stats["games"]
-    stats["xg_share"] = stats["xgf"] / (stats["xgf"] + stats["xga"])
+    # Protect against division by zero
+    total_xg = stats["xgf"] + stats["xga"]
+    stats["xg_share"] = np.where(total_xg > 0, stats["xgf"] / total_xg, 0.5)
     # Data dictionary: toi is seconds. per60 = per 60 minutes = per 3600 seconds.
-    stats["xgd_per60"] = (stats["xgf"] - stats["xga"]) / (stats["toi"] / 3600)
-    stats["shooting_pct"] = stats["gf"] / stats["sf"]
-    stats["save_pct"] = 1 - (stats["ga"] / stats["sa"])
+    toi_hours = stats["toi"] / 3600
+    stats["xgd_per60"] = np.where(toi_hours > 0, (stats["xgf"] - stats["xga"]) / toi_hours, 0)
+    stats["shooting_pct"] = np.where(stats["sf"] > 0, stats["gf"] / stats["sf"], 0)
+    stats["save_pct"] = np.where(stats["sa"] > 0, 1 - (stats["ga"] / stats["sa"]), 0)
     stats["pdo"] = stats["shooting_pct"] + stats["save_pct"]
     stats["pim_pg"] = stats["pim"] / stats["games"]
     return stats
@@ -265,7 +268,6 @@ def run_model_comparison(game, teams, n_splits=5):
                 subsample=0.8, colsample_bytree=0.8,
                 reg_alpha=1.0, reg_lambda=2.0,
                 eval_metric="logloss", random_state=42,
-                use_label_encoder=False,
             )
             xgb_model.fit(X_tr, y_tr)
             oof["XGBoost"][test_idx] = xgb_model.predict_proba(X_te)[:, 1]
