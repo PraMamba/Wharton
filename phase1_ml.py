@@ -3,13 +3,13 @@ WHSDSC 2026 Phase 1 — ML Enhancement Module
 =============================================
 Adds ML challenger models per Codex (GPT-5.3) recommendation:
   - Baseline: Home-ice only (~50.7%)
-  - Core model: Bradley-Terry logistic regression (current)
+  - Core model: OT-aware Bradley-Terry logistic regression
   - Challenger 1: Elastic Net logistic regression (regularized, interpretable)
-  - Challenger 2: XGBoost with monotonic constraints (high accuracy)
+  - Challenger 2: XGBoost tree benchmark (high accuracy, weaker calibration)
   - Challenger 3: Blended ensemble (Elastic Net + XGBoost)
 
 Reports: Accuracy, Log-loss, Brier score, Calibration curves
-Feature importance via permutation importance (model-agnostic)
+Feature importance via Elastic Net coefficients and XGBoost gain (SHAP optional)
 """
 
 import os, zipfile, warnings
@@ -28,6 +28,7 @@ from sklearn.model_selection import StratifiedKFold, cross_val_predict
 from sklearn.metrics import brier_score_loss, log_loss, accuracy_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.inspection import permutation_importance
+from sklearn.exceptions import ConvergenceWarning
 
 try:
     import xgboost as xgb
@@ -41,10 +42,13 @@ try:
 except ImportError:
     HAS_SHAP = False
 
-warnings.filterwarnings("ignore")
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-ZIP_PATH = "drive-download-20260205T132825Z-1-001.zip"
-OUTPUT_DIR = "output"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_ZIP = "drive-download-20260205T132825Z-1-001.zip"
+ZIP_PATH = os.environ.get("WHSDSC_ZIP", os.path.join(_SCRIPT_DIR, _DEFAULT_ZIP))
+OUTPUT_DIR = os.path.join(_SCRIPT_DIR, "output")
 
 
 # ───────────────────── DATA LOADING (reuse from phase1_final) ──────
@@ -67,10 +71,37 @@ def load_data():
     return df, matchups
 
 
+def _assert_game_constant_fields(df, group_col, cols, context):
+    """Guard against inconsistent line-level metadata before `.agg(first)`."""
+    if group_col not in df.columns:
+        return
+    gb = df.groupby(group_col, dropna=False)
+    for col in cols:
+        if col not in df.columns:
+            continue
+        nunq = gb[col].nunique(dropna=False)
+        bad = nunq[nunq > 1]
+        if bad.empty:
+            continue
+        sample_ids = ", ".join(str(x) for x in bad.index.tolist()[:3])
+        raise ValueError(
+            f"{context}: `{col}` is not constant within `{group_col}` "
+            f"for {len(bad)} group(s) (e.g., {sample_ids})"
+        )
+
+
 # ───────────────────── FEATURE ENGINEERING ──────────────────────────
 
 def build_game_features(df):
-    """Build game-level dataset with rich features for ML."""
+    """Build game-level dataset with rich features for ML.
+
+    Each row in the raw data is a line-matchup segment within a game,
+    so goals/xG/shots are spread across segments.  We use sum() to
+    reconstruct the full-game totals.
+    """
+    _assert_game_constant_fields(
+        df, "game_id", ["home_team", "away_team", "went_ot"], "build_game_features"
+    )
     game = df.groupby("game_id").agg(
         home_team=("home_team", "first"),
         away_team=("away_team", "first"),
@@ -131,10 +162,12 @@ def build_team_season_stats(game):
     return stats
 
 
-def fit_bradley_terry(game, teams, max_iter=200, tol=1e-8):
+def fit_bradley_terry(game, teams, ot_weight=0.5, max_iter=200, tol=1e-8):
+    """Bradley-Terry fit with optional OT/SO downweighting via `went_ot`."""
     team_idx = {t: i for i, t in enumerate(teams)}
     n = len(teams)
     strength = np.zeros(n)
+    has_ot_flag = "went_ot" in game.columns
     for _ in range(max_iter):
         grad = np.zeros(n)
         hess = np.zeros(n)
@@ -142,9 +175,12 @@ def fit_bradley_terry(game, teams, max_iter=200, tol=1e-8):
             i, j = team_idx[row["home_team"]], team_idx[row["away_team"]]
             p = expit(strength[i] - strength[j])
             y = row["home_win"]
-            grad[i] += y - p; grad[j] -= y - p
-            w = p * (1 - p)
-            hess[i] -= w; hess[j] -= w
+            game_w = ot_weight if (has_ot_flag and row["went_ot"] == 1) else 1.0
+            grad[i] += game_w * (y - p)
+            grad[j] -= game_w * (y - p)
+            fisher = game_w * p * (1 - p)
+            hess[i] -= fisher
+            hess[j] -= fisher
         hess = np.clip(hess, None, -1e-6)
         delta = -grad / hess
         delta -= delta.mean()
@@ -280,6 +316,8 @@ def run_model_comparison(game, teams, n_splits=5):
             oof["Gradient Boosting"][test_idx] = gb.predict_proba(X_te)[:, 1]
 
     # Blend (computed from leakage-safe OOF preds).
+    # NOTE: blend weights are manually chosen, not optimized via nested CV.
+    # A more rigorous approach would tune weights inside each fold.
     p_ml = oof["XGBoost"] if HAS_XGB else oof["Gradient Boosting"]
     oof["Blended Ensemble"] = 0.6 * oof["Elastic Net Logistic"] + 0.4 * p_ml
 
@@ -308,7 +346,13 @@ def run_model_comparison(game, teams, n_splits=5):
 # ───────────────────── FEATURE IMPORTANCE ───────────────────────────
 
 def compute_feature_importance(X, y, feature_names):
-    """Fit final models and extract feature importance."""
+    """
+    Refit final models on the full dataset and extract post-hoc feature importance.
+
+    This is intentionally separate from CV scoring: the reported CV metrics come from
+    `run_model_comparison()`, while this function is only for interpretability plots
+    and the final ML matchup model refit.
+    """
     scaler = StandardScaler()
     X_s = scaler.fit_transform(X)
 
@@ -423,7 +467,7 @@ def create_ml_dashboard(results, y, enet_coefs, xgb_imp, feature_names, output_d
         if name not in results:
             continue
         probs = results[name]["probs"]
-        bins = np.linspace(0.3, 0.75, 7)
+        bins = np.linspace(0.0, 1.0, 9)
         bin_centers, bin_means = [], []
         for i in range(len(bins)-1):
             mask = (probs >= bins[i]) & (probs < bins[i+1])
@@ -436,8 +480,8 @@ def create_ml_dashboard(results, y, enet_coefs, xgb_imp, feature_names, output_d
     ax3.set_ylabel("Observed Win Rate")
     ax3.set_title("Calibration Curves", fontweight="bold")
     ax3.legend(fontsize=7, loc="upper left")
-    ax3.set_xlim(0.3, 0.75)
-    ax3.set_ylim(0.3, 0.85)
+    ax3.set_xlim(0.0, 1.0)
+    ax3.set_ylim(0.0, 1.0)
 
     # ── Panel 4: Elastic Net coefficients ──
     ax4 = fig.add_subplot(gs[1, 0])
@@ -502,7 +546,7 @@ def create_ml_dashboard(results, y, enet_coefs, xgb_imp, feature_names, output_d
 
 def main():
     print("=" * 60)
-    print("WHSDSC 2026 — ML Model Comparison")
+    print("WHSDSC 2026 - ML Model Comparison")
     print("=" * 60)
 
     print("\n[1/7] Loading data...")
@@ -510,7 +554,7 @@ def main():
 
     print("[2/7] Building game features...")
     game = build_game_features(df)
-    teams = sorted(game["home_team"].unique().tolist())
+    teams = sorted(set(game["home_team"].tolist()) | set(game["away_team"].tolist()))
     team_stats = build_team_season_stats(game)
 
     print("[3/7] Fitting Bradley-Terry...")
@@ -525,14 +569,15 @@ def main():
     X = feat_df[feature_names].values
     y = feat_df["home_win"].values
 
-    print("\n  ┌─────────────────────────┬──────────┬──────────┬──────────┐")
-    print("  │ Model                   │ Accuracy │ Log-Loss │ Brier    │")
-    print("  ├─────────────────────────┼──────────┼──────────┼──────────┤")
+    print("\n  -------------------------------------------------------------")
+    print("  Model                     | Accuracy | Log-Loss | Brier")
+    print("  -------------------------------------------------------------")
     for name, r in results.items():
-        print(f"  │ {name:<23} │ {r['accuracy']:>7.1%}  │ {r['log_loss']:>8.4f} │ {r['brier']:>8.4f} │")
-    print("  └─────────────────────────┴──────────┴──────────┴──────────┘")
+        print(f"  {name:<25} | {r['accuracy']:>7.1%} | {r['log_loss']:>8.4f} | {r['brier']:>8.4f}")
+    print("  -------------------------------------------------------------")
 
     print("\n[6/7] Computing feature importance...")
+    print("  Note: feature importance uses full-data refits (interpretability only; CV metrics are unchanged).")
     enet_coefs, xgb_imp, shap_values, enet_model, scaler = compute_feature_importance(X, y, feature_names)
 
     print("  Elastic Net top 3:", ", ".join(f"{n}({v:.3f})" for n, v in enet_coefs.head(3).items()))
@@ -556,6 +601,11 @@ def main():
     summary += "|-------|----------|----------|-------------|\n"
     for name, r in results.items():
         summary += f"| {name} | {r['accuracy']:.1%} | {r['log_loss']:.4f} | {r['brier']:.4f} |\n"
+
+    summary += "\n## Feature Importance Caveat\n\n"
+    summary += ("Feature importance values below come from **full-data refits** of the final models "
+                "(post-hoc interpretation only). They are not leakage-safe CV estimates and should "
+                "not be interpreted as out-of-sample effect sizes.\n")
 
     summary += "\n## Feature Importance (Elastic Net |Coefficients|)\n\n"
     summary += "| Feature | |Coefficient| |\n|---------|-------------|\n"
@@ -583,7 +633,7 @@ def main():
     summary += "|------|------|------|------------|----------------|\n"
 
     # Load core model predictions for comparison
-    core_path = os.path.join(OUTPUT_DIR, "phase1_final_matchups.csv")
+    core_path = os.path.join(OUTPUT_DIR, "submission", "matchup_predictions.csv")
     if os.path.exists(core_path):
         core = pd.read_csv(core_path)
         for i, (_, m) in enumerate(ml_matchups.iterrows()):

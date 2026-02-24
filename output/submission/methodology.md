@@ -5,24 +5,22 @@
 ## 1. Process
 
 ### Data Cleaning & Transformation (~50 words)
-We validated 25,827 line-level records across 1,312 games (32 teams), confirming zero missing values. We aggregated line-level rows to game-level outcomes and stacked home/away records symmetrically for unbiased team statistics. For line-disparity analysis we restricted to first/second offensive lines vs first/second defensive pairings (excluding PP/PK and empty-net segments). Overtime games were flagged for special handling in our strength model.
+We validated 25,827 line-level records across 1,312 games (32 teams) and confirmed zero missing values. We aggregated rows to game outcomes, preserved home/away identity symmetrically, and dropped tied-score anomalies if any. For line disparity we restricted to first/second offense versus first/second defense, excluding PP/PK and empty-net contexts.
 
 ### Additional Variables (~25 words)
-Engineered: xG differential per 60 min, xG share, OT-aware Bradley-Terry strength, strength of schedule, adjusted line xG/60 (controlling for defensive matchup difficulty), GSAx per game (goaltender quality above expected), xG per shot (offensive chance quality), PIM per game and penalty differential (team discipline).
+Engineered variables: xG differential/60, xG share, OT-aware Bradley-Terry strength, strength of schedule, adjusted line xG/60 ratio, GSAx/game, xG/shot, PIM/game, and penalty differential.
 
 ---
 
 ## 2. Tools & Techniques
 
 ### Software Tools (~50 words)
-Python (pandas, numpy, scipy, matplotlib, scikit-learn, xgboost). Bradley-Terry fitted via iterative MLE with OT-downweighting. Logistic regression optimized via scipy. ML challengers (Elastic Net, XGBoost) were used as benchmarks; final submission uses the simpler BT-only model. Three AI assistants (Claude, Gemini, Codex) provided independent cross-validation and methodology critique.
+Python stack: pandas, numpy, scipy, matplotlib, scikit-learn, and xgboost (benchmark only). Bradley-Terry was fit with iterative MLE and overtime downweighting. Logistic regression calibrated BT strength differences into win probabilities. We used 5-fold cross-validation, log-loss, Brier score, and calibration bins before finalizing the simpler BT-only submission model.
 
 ### Statistical Methods (~100 words)
-Our approach rests on the **Bradley-Terry paired comparison model**, fitted via maximum likelihood on all 1,312 games. Overtime games receive half weight, since OT outcomes are near coin-flips (52.1% home win in OT vs 57.6% in regulation) and carry weaker signal about true team quality.
+Our core model is a **Bradley-Terry paired-comparison model** fit by maximum likelihood on all 1,312 games. Overtime outcomes are weighted 0.5 because they are closer to coin flips (52.1% home OT win versus 57.6% in regulation), so they carry weaker quality signal.
 
-Win probabilities come from **calibrated logistic regression**: P(home_win) = sigmoid(0.2724 + 0.9350 × BT_strength_diff), with the intercept capturing 56.8% home-ice advantage. We validated this via **5-fold cross-validation** (accuracy 58.1% ± 3.2%, Brier 0.2410).
-
-We also prototyped multi-feature ML challengers (Elastic Net, boosting) in a separate module. For this submission we use the BT-only logistic for transparency and stable calibration.
+Win probability uses calibrated logistic regression: P(home_win) = sigmoid(0.2724 + 0.9350 * BT_strength_diff). The intercept implies 56.8% baseline home-ice advantage. Leakage-safe 5-fold CV gives accuracy 57.0% +/- 3.2%, Brier 0.2430, and stable calibration. We tested richer ML challengers separately, but kept BT-only logistic for interpretability and reproducibility.
 
 ---
 
@@ -32,7 +30,7 @@ We also prototyped multi-feature ML challengers (Elastic Net, boosting) in a sep
 Teams ranked by composite of OT-aware Bradley-Terry strength (40%), xGD/60 (30%), xG share (10%), goal differential (10%), and win percentage (10%). BT inherently controls for opponent quality. Win probabilities from calibrated logistic regression on BT strength differential; benchmark ML models offered only marginal lift, so we prioritized transparency and stable probability outputs.
 
 ### 1b: Offensive Line Quality Disparity (~50 words)
-We computed xG per 60 for each team's first and second offensive lines at even strength. We adjusted for **defensive matchup confounding** (as recommended by the competition workbook)—lines facing elite defensive pairings were normalized relative to league-average difficulty. The adjusted disparity ratio quantifies true lineup imbalance.
+We computed xG per 60 for each team's first and second offensive lines at even strength. We adjusted for **defensive matchup confounding** using opponent defensive-pairing tiers (`first_def` vs `second_def`) rather than team-specific defense ratings. The adjusted disparity ratio quantifies lineup imbalance after this tier-level normalization.
 
 ### 1c: Visualization Choices (~50 words)
 A scatter plot maps adjusted disparity (x) against composite strength (y) with linear regression overlay, Pearson r, and R². Color encodes strength for quick tier identification. Key teams labeled. This directly tests the commissioner's question: do balanced lineups predict success? Our finding: no strong linear relationship.
@@ -42,12 +40,12 @@ A scatter plot maps adjusted disparity (x) against composite strength (y) with l
 ## 4. Insights
 
 ### Model Performance Assessment (~50 words)
-We used **5-fold cross-validation** (refitting BT + logistic each fold): accuracy 58.1% (±3.2%), log-loss 0.6752, Brier score 0.2410. Calibration bins from out-of-fold predictions compare average predicted probabilities to observed win rates, and baseline comparison (home-win rate only) contextualizes the lift.
+We used leakage-safe **5-fold stratified CV**, refitting BT and logistic within each fold. Random-CV performance was accuracy 57.0% (+/- 3.2%), log-loss 0.6797, and Brier 0.2430 versus baseline (56.4%, 0.6849, 0.2459). In an **ID-order stress test** (sorting by numeric `game_id`, not true dates), BT was outperformed by the home-rate baseline on all three metrics (accuracy 54.7% vs 56.2%, log-loss 0.7047 vs 0.6860, Brier 0.2524 vs 0.2464). Because `game_id` order is not guaranteed to reflect chronology in this simulated dataset, we treat this as a pessimistic robustness check rather than evidence of real-world failure.
 
 **Limitations:** As stated in the workbook, team/line quality is treated as stable across the season; we therefore do not time-weight games or model roster/injury shocks (not provided in data).
 
 ### Generative AI Usage (~50 words)
-Three AI models collaborated: **Claude** (Anthropic) designed the analysis pipeline and code. **Gemini** (Google) critiqued rankings and suggested goaltending/special-teams features. **Codex** (OpenAI, GPT-5.3) recommended ML challenger validation and Brier score reporting. All outputs were cross-validated; final methodological decisions were human-guided.
+Three AI tools supported workflow review: **Claude** (pipeline draft), **Gemini** (feature critique), and **Codex** (validation and calibration checks). Their suggestions were treated as hypotheses, then verified through reproducible code and cross-validation. Final model choices, metrics, and submission files were selected by the team.
 
 ---
 
@@ -128,21 +126,22 @@ Three AI models collaborated: **Claude** (Anthropic) designed the analysis pipel
 
 ### Probability Calibration
 
+Calibration bins are computed on out-of-fold predictions; bins with fewer than 10 games are omitted for stability.
+
 | Bin Center | Avg Predicted | Observed Win Rate | N |
 |------------|--------------|-------------------|---|
-| 0.34 | 0.351 | 0.390 | 77 |
-| 0.42 | 0.430 | 0.512 | 207 |
-| 0.51 | 0.512 | 0.531 | 290 |
-| 0.59 | 0.591 | 0.539 | 334 |
-| 0.67 | 0.671 | 0.672 | 262 |
-| 0.76 | 0.753 | 0.699 | 103 |
+| 0.31 | 0.334 | 0.407 | 86 |
+| 0.44 | 0.447 | 0.512 | 297 |
+| 0.56 | 0.565 | 0.532 | 504 |
+| 0.69 | 0.680 | 0.666 | 353 |
+| 0.81 | 0.790 | 0.712 | 66 |
 
 ### Model Comparison (5-Fold CV)
 
 | Model | Accuracy | Log-Loss | Brier |
 |-------|----------|----------|-------|
-| Baseline (home=56.4%) | 56.4% | 0.6861 | 0.2465 |
-| **OT-Aware BT Logistic** | **58.1%** | **0.6752** | **0.2410** |
+| Baseline (home=56.4%) | 56.4% | 0.6849 | 0.2459 |
+| **OT-Aware BT Logistic** | **57.0%** | **0.6797** | **0.2430** |
  
 *OT-aware BT logistic chosen for its interpretability, calibration quality, and principled treatment of overtime games.*
 

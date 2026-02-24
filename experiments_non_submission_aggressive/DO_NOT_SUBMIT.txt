@@ -1,0 +1,5 @@
+NON-SUBMISSION ZONE
+
+These files are for aggressive model experimentation only.
+Do NOT copy these outputs into official competition submission uploads.
+

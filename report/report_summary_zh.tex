@@ -93,7 +93,7 @@ WHSDSC（沃顿高中数据科学竞赛）2026 第一阶段要求选手对 WHL 2
 \end{enumerate}
 
 \subsection{核心思路}
-我们使用\textbf{加时赛感知的 Bradley-Terry 配对比较模型}估计球队潜在实力参数，然后通过\textbf{校准逻辑回归}将实力差转化为胜率预测——5 折交叉验证 Brier 分数达到 \textbf{0.2410}（基线 0.2465）。
+我们使用\textbf{加时赛感知的 Bradley-Terry 配对比较模型}估计球队潜在实力参数，然后通过\textbf{校准逻辑回归}将实力差转化为胜率预测——5 折交叉验证 Brier 分数达到 \textbf{0.2430}（基线 0.2459）。
 
 % ═════════════════════════════════════════════════════════════
 \section{数据处理流程}
@@ -333,22 +333,24 @@ $\boldsymbol{\beta} \leftarrow \boldsymbol{\beta} - \overline{\beta}$ \tcp*{最�
 \toprule
 \textbf{模型} & \textbf{准确率} & \textbf{Log-Loss} & \textbf{Brier 分数} \\
 \midrule
-基线（主队胜率 = 56.4\%） & 56.4\% & 0.6861 & 0.2465 \\
-\textbf{加时赛感知 BT 逻辑回归} & \textbf{58.1\% $\pm$ 3.2\%} & \textbf{0.6752} & \textbf{0.2410} \\
+基线（主队胜率 = 56.4\%） & 56.4\% & 0.6849 & 0.2459 \\
+\textbf{加时赛感知 BT 逻辑回归} & \textbf{57.0\% $\pm$ 3.2\%} & \textbf{0.6797} & \textbf{0.2430} \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \noindent\textbf{指标解读}：
 \begin{itemize}
-    \item \textbf{准确率}（58.1\%）：相比``永远预测主队胜''的基线（56.4\%）提升不大。这符合预期——冰球是四大职业联赛中随机性最高的运动，专业模型准确率也仅在 58--62\% 之间。
-    \item \textbf{Log-Loss}（0.6752）：衡量概率预测的置信度质量。越低越好。
-    \item \textbf{Brier 分数}（0.2410）：概率预测的均方误差。相比基线降低 2.2\%，在高随机性运动中已是有意义的提升。
+    \item \textbf{准确率}（57.0\%）：在随机 5 折 CV 中，相比``永远预测主队胜''基线（56.4\%）仅有小幅提升，应按有限提升解读。
+    \item \textbf{Log-Loss}（0.6797）：衡量概率预测的置信度质量。越低越好。
+    \item \textbf{Brier 分数}（0.2430）：概率预测的均方误差。在随机 CV 中相对基线约下降 1.2\%，属于有限但有用的校准改善。
+    \item \textbf{ID-order 压力测试（非真实时序）}：按数值 \texttt{game\_id} 排序的压力测试中，BT 在三项指标上均劣于主场胜率基线（准确率 54.7\% vs 56.2\%，Log-Loss 0.7047 vs 0.6860，Brier 0.2524 vs 0.2464）。由于该模拟数据中的 \texttt{game\_id} 顺序不保证等于真实时间顺序，我们将其视为偏保守的鲁棒性检查，而非部署失败证据。
 \end{itemize}
 
 \subsection{概率校准}
 
 校准衡量预测概率与实际结果的一致性。我们使用\textbf{折外 (OOF) 预测}计算校准分箱，防止乐观偏差。
+为避免小样本带来的波动，我们仅报告样本量不少于 10 场的分箱。
 
 \begin{table}[H]
 \centering
@@ -358,17 +360,16 @@ $\boldsymbol{\beta} \leftarrow \boldsymbol{\beta} - \overline{\beta}$ \tcp*{最�
 \toprule
 \textbf{分箱中心} & \textbf{平均预测值} & \textbf{实际胜率} & \textbf{样本量 $N$} \\
 \midrule
-0.34 & 0.351 & 0.390 & 77 \\
-0.42 & 0.430 & 0.512 & 207 \\
-0.51 & 0.512 & 0.531 & 290 \\
-0.59 & 0.591 & 0.539 & 334 \\
-0.67 & 0.671 & 0.672 & 262 \\
-0.76 & 0.753 & 0.699 & 103 \\
+0.31 & 0.334 & 0.407 & 86 \\
+0.44 & 0.447 & 0.512 & 297 \\
+0.56 & 0.565 & 0.532 & 504 \\
+0.69 & 0.680 & 0.666 & 353 \\
+0.81 & 0.790 & 0.712 & 66 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
-\noindent 模型在 0.35--0.70 范围内校准良好。在高端（预测 0.75，实际 0.70）存在轻微\textbf{过度自信}，这是已知的局限性（见第~\ref{sec:limitations} 节）。
+\noindent 模型在 0.44--0.69 范围内校准良好。在高端（预测 0.79，实际 0.71）存在\textbf{过度自信}，这是已知的局限性（见第~\ref{sec:limitations} 节）。
 
 % ═════════════════════════════════════════════════════════════
 \section{集成实力排名}
@@ -388,7 +389,7 @@ z_{i,m} = \frac{x_{i,m} - \bar{x}_m}{\sigma_m}
 \centering
 \caption{集成权重分配及理由}
 \label{tab:weights}
-\begin{tabular}{lcp{7cm}}
+\begin{tabular}{lcl}
 \toprule
 \textbf{指标} & \textbf{权重} & \textbf{理由} \\
 \midrule
@@ -403,7 +404,7 @@ xG 份额 & 10\% & 相对进攻优势 \\
 
 \subsection{权重鲁棒性}
 
-我们测试了四种备选权重方案：BT 独占（100\%）、均等（各 20\%）、xG 倾斜（xGD/60 占 50\%）。所有方案之间的 Spearman 秩相关系数为 \textbf{0.90--0.99}。前 6 名球队在所有方案中保持一致，证明排名对权重选择具有鲁棒性。
+我们测试了四种权重方案（含最终方案）：BT 独占（100\%）、均等（各 20\%）、xG 倾斜（xGD/60 占 50\%）等。所有方案之间的 Spearman 秩相关系数为 \textbf{0.81--1.00}。前 6 名中有 \textbf{5 支球队}在所有方案中保持一致，说明头部排名总体稳健但并非完全不受权重影响。该结果现由 \texttt{phase1\_submit.py} 自动生成的内部证据文件 \texttt{output/submission/ranking\_weight\_sensitivity.md} 复核。
 
 \subsection{Top 10 排名}
 
@@ -486,13 +487,13 @@ xG 份额 & 10\% & 相对进攻优势 \\
 
 比值为 1.0 表示完全均衡；$> 1.0$ 表示球队过度依赖一线。
 
-\textbf{关键校正}：原始 xG/60 受防守对位质量的混杂影响。面对精英防守组的一线自然会产出更少的 xG。我们通过\textbf{防守难度因子}进行归一化：
+\textbf{关键校正}：原始 xG/60 受防守对位质量的混杂影响。我们按对位防守组层级（\texttt{first\_def} vs \texttt{second\_def}）计算\textbf{防守难度因子}并进行归一化；这是一种分层校正，而非基于具体球队防守实力的完全校正：
 
 \begin{equation}
 \text{校正 xG/60}_{\text{线}} = \frac{\text{原始 xG/60}_{\text{线}}}{\text{防守难度因子}_{\text{对位防守组}}}
 \end{equation}
 
-其中防守难度因子 = 该防守组的 xGA/60 与联盟平均值之比。
+其中防守难度因子 = 该防守组层级（1 对或 2 对）的 xGA/60 与联盟平均值之比。
 
 \textbf{数据过滤}：仅保留均势对抗（1/2 线进攻 vs.\ 1/2 对防守组），排除强打、少打和空门时段。
 
@@ -528,7 +529,7 @@ xG 份额 & 10\% & 相对进攻优势 \\
 
 \begin{figure}[H]
     \centering
-    \includegraphics[width=0.82\textwidth]{../output/submission/TheIsoLab.png}
+    \includegraphics[width=0.82\textwidth]{../output/final_submission/TheIsoLab.png}
     \caption{校正进攻线差异（x 轴） vs.\ 综合实力评分（y 轴）。Pearson $r = -0.031$，$R^2 = 0.001$。\textbf{结论}：不存在显著线性关系——球队通过多样化的阵容策略取得成功。}
     \label{fig:scatter}
 \end{figure}
@@ -562,16 +563,16 @@ xG 份额 & 10\% & 相对进攻优势 \\
 \begin{figure}[H]
     \centering
     \includegraphics[width=\textwidth]{fig_ml_comparison.png}
-    \caption{ML 模型对比仪表盘（6 面板）：（左上）5 折 CV 准确率对比——XGBoost 57.5\% 最高，（中上）Brier 分数与 Log-Loss 对比，（右上）各模型校准曲线，（左下/中下）Elastic Net 与 XGBoost 特征重要性，（右下）汇总表。总体上复杂 ML 仅带来边际提升，且可能牺牲校准；BT 仍是最重要的单一特征。}
+    \caption{ML 模型对比仪表盘（6 面板）：（左上）5 折 CV 准确率对比——Elastic Net 58.0\% 最高，（中上）Brier 分数与 Log-Loss 对比，（右上）各模型校准曲线，（左下/中下）Elastic Net 与 XGBoost 特征重要性，（右下）汇总表。总体上复杂 ML 在随机 CV 中可带来边际提升，但稳健性与可解释性仍需权衡。}
     \label{fig:ml}
 \end{figure}
 
 \noindent\textbf{关键发现}：
 \begin{itemize}[nosep]
-    \item \textbf{最佳准确率}：XGBoost 达到 57.5\%，但 Log-Loss 0.7154、Brier 0.2575，校准明显变差，不适合作为概率输出模型。
-    \item \textbf{最佳概率质量}：Elastic Net 逻辑回归在 Log-Loss（0.6774）与 Brier（0.2421）上最优，但准确率仅 57.0\%，且引入多变量复杂性。
-    \item \textbf{可解释性最强且竞争力足够}：BT-only 逻辑回归（57.3\%，Log-Loss 0.6814，Brier 0.2437）已接近最优；混合集成（56.9\%）未带来稳定提升。
-    \item XGBoost 和 Elastic Net 的特征重要性均显示 \textbf{BT 是最重要的单一预测变量}。
+    \item \textbf{随机 CV 下最佳准确率}：Elastic Net 达到 58.0\%，同时 Log-Loss 0.6758、Brier 0.2412 也最优；但其复杂度与特征依赖高于 BT-only 模型。
+    \item \textbf{XGBoost 仍存在校准问题}：准确率 56.7\%，Log-Loss 0.7157、Brier 0.2574，作为概率输出模型明显偏弱。
+    \item \textbf{BT-only 仍是强基线}：OT-aware BT 逻辑回归（57.0\%，Log-Loss 0.6796，Brier 0.2430）在可解释性与稳定性上更适合作为正式提交模型；混合集成（57.8\%，Brier 0.2443）并未在概率质量上超过 Elastic Net。
+    \item 特征重要性（基于全量数据重拟合、仅用于解释）显示 \textbf{BT 与胜率差等汇总实力特征}均位于前列，复杂模型主要在这些信号上做非线性重加权。
     \item 因此最终提交仍采用 \textbf{OT-aware BT + 校准逻辑回归}，优先考虑\textbf{可解释性和稳定校准}（见第~\ref{sec:logistic} 节）。
 \end{itemize}
 
@@ -601,7 +602,7 @@ xG 份额 & 10\% & 相对进攻优势 \\
 \begin{table}[H]
 \centering
 \caption{AI 协作分工}
-\begin{tabular}{lp{8cm}}
+\begin{tabular}{ll}
 \toprule
 \textbf{AI} & \textbf{贡献} \\
 \midrule
@@ -621,9 +622,9 @@ xG 份额 & 10\% & 相对进攻优势 \\
 \begin{enumerate}
     \item \textbf{球队实力静态假设}：我们将球队实力视为赛季内恒定。现实中球队会因交易、伤病和势头而变化。时间衰减加权（如指数衰减）可以改善，但数据集未提供日期/场序信息。
 
-    \item \textbf{高端过度自信}：校准显示预测概率超过 70\% 时，实际偏乐观 5--13 个百分点（预测 0.75，实际 0.70）。折外保序回归 (isotonic calibration) 可缓解此问题。
+    \item \textbf{高端过度自信}：校准显示预测概率超过 75\% 时，实际偏乐观约 8 个百分点（预测 0.79，实际 0.71）。折外保序回归 (isotonic calibration) 可缓解此问题。
 
-    \item \textbf{冰球的固有随机性}：58.1\% 的准确率上限在冰球中是正常的。冰球是四大职业联赛中单场得分最低的运动，使得单场预测存在根本性限制。
+    \item \textbf{冰球的固有随机性}：我们当前 57.0\% 的交叉验证准确率与冰球的高随机性特征一致。冰球是四大职业联赛中单场得分最低的运动，使得单场预测存在根本性限制。
 
     \item \textbf{无球员级建模}：我们将球队视为整体。纳入球员级数据（如 WAR、Corsi）可提升精细度，但数据集未提供。
 
@@ -639,7 +640,7 @@ xG 份额 & 10\% & 相对进攻优势 \\
 \begin{itemize}
     \item \textbf{加时赛感知 Bradley-Terry 模型}：正确地将加时赛胜利视为较弱的信号。
     \item \textbf{校准逻辑回归}：提供可解释的胜率预测，配合诚实的折外评估。
-    \item \textbf{防守校正的进攻线差异指标}：控制了对位混杂因素。
+    \item \textbf{防守分层校正的进攻线差异指标}：控制了 1 对/2 对对位层级带来的主要混杂因素。
     \item 明确发现\textbf{进攻线均衡度与球队成功之间不存在显著关系}（$r = -0.031$）。
 \end{itemize}
 
