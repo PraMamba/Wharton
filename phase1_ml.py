@@ -5,29 +5,39 @@ Adds ML challenger models per Codex (GPT-5.3) recommendation:
   - Baseline: Home-ice only (~50.7%)
   - Core model: Bradley-Terry logistic regression (current)
   - Challenger 1: Elastic Net logistic regression (regularized, interpretable)
-  - Challenger 2: XGBoost with monotonic constraints (high accuracy)
+  - Challenger 2: XGBoost/GradientBoosting (high accuracy)
   - Challenger 3: Blended ensemble (Elastic Net + XGBoost)
+  - Challenger 4: Poisson/Skellam model (count-based)
 
 Reports: Accuracy, Log-loss, Brier score, Calibration curves
-Feature importance via permutation importance (model-agnostic)
 """
 
-import os, zipfile, warnings
+import os, warnings
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from scipy.optimize import minimize
 from scipy.special import expit
+
+from core.data import load_data, build_game_level
+from core.bt import fit_bt, fit_attack_defense, skellam_predict_ad
+from core.stats import build_team_stats
+from core.advanced import (build_special_teams, build_line_depth,
+                           build_goalie_features, build_high_danger,
+                           residualize_features, build_rapm_features,
+                           build_toi_entropy, build_matchup_matrix,
+                           build_st_expected_value, build_volatility_features,
+                           stack_records)
+from core.config import CFG
 
 from sklearn.linear_model import LogisticRegressionCV
 from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import StratifiedKFold, cross_val_predict
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
 from sklearn.metrics import brier_score_loss, log_loss, accuracy_score
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.preprocessing import StandardScaler
-from sklearn.inspection import permutation_importance
 
 try:
     import xgboost as xgb
@@ -35,174 +45,226 @@ try:
 except ImportError:
     HAS_XGB = False
 
-try:
-    import shap
-    HAS_SHAP = True
-except ImportError:
-    HAS_SHAP = False
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*lbfgs.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*max_iter.*", category=ConvergenceWarning)
 
-warnings.filterwarnings("ignore")
-
-ZIP_PATH = "drive-download-20260205T132825Z-1-001.zip"
 OUTPUT_DIR = "output"
 
+# ── Feature tiers ────────────────────────────────────────────────────
+# Core: used by BT-only and base Elastic Net (5 features)
+# Removed xg_share_diff (r=0.83 with ev_xgd60_diff) and save_pct_diff (r=0.85 with gsax60_shrunk_diff)
+CORE_FEATURES = [
+    "bt_diff", "ev_xgd60_diff",
+    "gsax60_shrunk_diff", "fin60_shrunk_diff", "pp_edge",
+]
 
-# ───────────────────── DATA LOADING (reuse from phase1_final) ──────
+# Extended: residualized features replace raw collinear ones (5 core + 17 resid = 22 features)
+EXTENDED_FEATURES = CORE_FEATURES + [
+    "ev_xgd60_resid_diff", "gsax60_shrunk_resid_diff",
+    "fin60_shrunk_resid_diff", "pp_xgf60_resid_diff",
+    "pk_xga60_resid_diff", "depth_gap_resid_diff",
+    "high_danger_freq60_resid_diff",
+    "shooting_pct_resid_diff",
+    # New residualized features
+    "off_line_entropy_resid_diff", "def_pairing_entropy_resid_diff",
+    "top_vs_top_share_resid_diff", "top_shelter_share_resid_diff",
+    "exploit_ability_resid_diff", "shutdown_resilience_resid_diff",
+    "net_st_ev_resid_diff", "xgd60_std_game_resid_diff", "gsax_volatility_resid_diff",
+]
 
-def ensure_extracted(zip_path, filename, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, filename)
-    if os.path.exists(out_path):
-        return out_path
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extract(filename, output_dir)
-    return out_path
+# Full: add RAPM + other non-residualized features (22 extended + 12/13 = 34/35 features)
+# Exclude quality_vs_goalie if symmetric augmentation is enabled (asymmetric feature)
+_FULL_BASE = [
+    "gd_pg_diff", "mean_max_xg_for_diff", "pen60_diff",
+    "starter_toi_share_diff", "quality_vs_goalie",
+    "rapm_attack_diff", "rapm_defense_diff", "rapm_topline_effect_diff",
+    # New non-residualized features
+    "goalie_entropy_diff", "depth_insurance_diff", "pen_drawn60_diff",
+    "blowout_rate_diff", "close_game_rate_diff",
+]
 
+if CFG.get("augmentation", {}).get("symmetric", False):
+    FULL_FEATURES = EXTENDED_FEATURES + [f for f in _FULL_BASE if f != "quality_vs_goalie"]
+else:
+    FULL_FEATURES = EXTENDED_FEATURES + _FULL_BASE
 
-def load_data():
-    whl_path = ensure_extracted(ZIP_PATH, "whl_2025.csv", OUTPUT_DIR)
-    matchups_path = ensure_extracted(ZIP_PATH, "WHSDSC_Rnd1_matchups.xlsx", OUTPUT_DIR)
-    df = pd.read_csv(whl_path)
-    matchups = pd.read_excel(matchups_path)
-    return df, matchups
+# Columns to residualize from team_stats
+RESID_STAT_COLS = ["gsax60_shrunk", "fin60_shrunk", "shooting_pct"]
+
+# Columns to residualize from advanced DataFrames
+RESID_ADV_COLS = {
+    "special_teams": ["ev_xgd60", "pp_xgf60", "pk_xga60"],
+    "line_depth": ["depth_gap"],
+    "high_danger": ["high_danger_freq60"],
+    "toi_entropy": ["off_line_entropy", "def_pairing_entropy", "top_vs_top_share", "top_shelter_share"],
+    "matchup_matrix": ["exploit_ability", "shutdown_resilience"],
+    "st_ev": ["net_st_ev"],
+    "volatility": ["xgd60_std_game", "gsax_volatility"],
+}
 
 
 # ───────────────────── FEATURE ENGINEERING ──────────────────────────
 
-def build_game_features(df):
-    """Build game-level dataset with rich features for ML."""
-    game = df.groupby("game_id").agg(
-        home_team=("home_team", "first"),
-        away_team=("away_team", "first"),
-        home_goals=("home_goals", "sum"),
-        away_goals=("away_goals", "sum"),
-        home_xg=("home_xg", "sum"),
-        away_xg=("away_xg", "sum"),
-        home_shots=("home_shots", "sum"),
-        away_shots=("away_shots", "sum"),
-        went_ot=("went_ot", "first"),
-        toi=("toi", "sum"),
-        home_pen_min=("home_penalty_minutes", "sum"),
-        away_pen_min=("away_penalty_minutes", "sum"),
-    ).reset_index()
-    game["home_win"] = (game["home_goals"] > game["away_goals"]).astype(int)
-    return game
+def _symmetric_augment(X, y):
+    """Symmetric augmentation for tree models: flip sign of features and labels.
+
+    Returns augmented data with doubled size.
+    """
+    X_aug = np.vstack([X, -X])
+    y_aug = np.concatenate([y, 1 - y])
+    return X_aug, y_aug
 
 
-def build_team_season_stats(game):
-    """Compute full-season per-team stats to use as features."""
-    records = []
-    for _, row in game.iterrows():
-        records.append({
-            "team": row["home_team"], "gf": row["home_goals"], "ga": row["away_goals"],
-            "xgf": row["home_xg"], "xga": row["away_xg"],
-            "sf": row["home_shots"], "sa": row["away_shots"],
-            "toi": row["toi"], "win": row["home_win"],
-            "pim": row["home_pen_min"],
-        })
-        records.append({
-            "team": row["away_team"], "gf": row["away_goals"], "ga": row["home_goals"],
-            "xgf": row["away_xg"], "xga": row["home_xg"],
-            "sf": row["away_shots"], "sa": row["home_shots"],
-            "toi": row["toi"], "win": 1 - row["home_win"],
-            "pim": row["away_pen_min"],
-        })
-    tg = pd.DataFrame(records)
-    stats = tg.groupby("team").agg(
-        games=("win", "count"), wins=("win", "sum"),
-        gf=("gf", "sum"), ga=("ga", "sum"),
-        xgf=("xgf", "sum"), xga=("xga", "sum"),
-        sf=("sf", "sum"), sa=("sa", "sum"),
-        toi=("toi", "sum"), pim=("pim", "sum"),
-    )
-    stats["win_pct"] = stats["wins"] / stats["games"]
-    stats["gd_pg"] = (stats["gf"] - stats["ga"]) / stats["games"]
-    stats["xgd_pg"] = (stats["xgf"] - stats["xga"]) / stats["games"]
-    # Protect against division by zero
-    total_xg = stats["xgf"] + stats["xga"]
-    stats["xg_share"] = np.where(total_xg > 0, stats["xgf"] / total_xg, 0.5)
-    # Data dictionary: toi is seconds. per60 = per 60 minutes = per 3600 seconds.
-    toi_hours = stats["toi"] / 3600
-    stats["xgd_per60"] = np.where(toi_hours > 0, (stats["xgf"] - stats["xga"]) / toi_hours, 0)
-    stats["shooting_pct"] = np.where(stats["sf"] > 0, stats["gf"] / stats["sf"], 0)
-    stats["save_pct"] = np.where(stats["sa"] > 0, 1 - (stats["ga"] / stats["sa"]), 0)
-    stats["pdo"] = stats["shooting_pct"] + stats["save_pct"]
-    stats["pim_pg"] = stats["pim"] / stats["games"]
-    return stats
+def _build_advanced_dict(special_teams=None, line_depth=None, goalie_feats=None,
+                         high_danger=None, toi_entropy=None, matchup_matrix=None,
+                         st_ev=None, volatility=None, rapm=None):
+    """Build {source_name: DataFrame} dict, omitting None entries."""
+    d = {}
+    for name, val in [("special_teams", special_teams), ("line_depth", line_depth),
+                      ("goalie_feats", goalie_feats), ("high_danger", high_danger),
+                      ("toi_entropy", toi_entropy), ("matchup_matrix", matchup_matrix),
+                      ("st_ev", st_ev), ("volatility", volatility), ("rapm", rapm)]:
+        if val is not None:
+            d[name] = val
+    return d
 
 
-def fit_bradley_terry(game, teams, max_iter=200, tol=1e-8):
-    team_idx = {t: i for i, t in enumerate(teams)}
-    n = len(teams)
-    strength = np.zeros(n)
-    for _ in range(max_iter):
-        grad = np.zeros(n)
-        hess = np.zeros(n)
-        for _, row in game.iterrows():
-            i, j = team_idx[row["home_team"]], team_idx[row["away_team"]]
-            p = expit(strength[i] - strength[j])
-            y = row["home_win"]
-            grad[i] += y - p; grad[j] -= y - p
-            w = p * (1 - p)
-            hess[i] -= w; hess[j] -= w
-        hess = np.clip(hess, None, -1e-6)
-        delta = -grad / hess
-        delta -= delta.mean()
-        strength += 0.5 * delta
-        if np.max(np.abs(delta)) < tol:
-            break
-    strength -= strength.mean()
-    return dict(zip(teams, strength))
+def build_ml_features(game, team_stats, bt_strength, advanced_features=None,
+                      residualized_stats=None, bt_std=None):
+    """Build feature matrix for each game: home_feature - away_feature (differential).
 
+    Supports extended features from advanced DataFrames when provided.
+    advanced_features is a dict {source_name: DataFrame} built by _build_advanced_dict().
+    """
+    if advanced_features is None:
+        advanced_features = {}
 
-def build_ml_features(game, team_stats, bt_strength):
-    """Build feature matrix for each game: home_feature - away_feature (differential)."""
-    feature_cols = ["win_pct", "gd_pg", "xgd_pg", "xg_share", "xgd_per60",
-                    "shooting_pct", "save_pct", "pdo", "pim_pg"]
+    # Differential columns from team_stats
+    stat_diff_cols = [
+        "win_pct", "gd_pg", "xgd_pg", "xg_share", "xgd_per60",
+        "shooting_pct", "save_pct", "pim_pg",
+        "xg_per_shot_against", "shots_for60",
+        "fin60_shrunk", "gsax60_shrunk", "mean_max_xg_for",
+    ]
+    # Add optional columns if they exist in team_stats
+    for col in ["pim60", "pen60"]:
+        if col in team_stats.columns:
+            stat_diff_cols.append(col)
 
-    rows = []
-    for _, g in game.iterrows():
-        h, a = g["home_team"], g["away_team"]
-        row = {"game_id": g["game_id"], "home_win": g["home_win"]}
-        # BT strength differential
-        row["bt_diff"] = bt_strength.get(h, 0) - bt_strength.get(a, 0)
-        # All stat differentials
-        for col in feature_cols:
-            hv = team_stats.loc[h, col] if h in team_stats.index else 0
-            av = team_stats.loc[a, col] if a in team_stats.index else 0
-            row[f"{col}_diff"] = hv - av
-        rows.append(row)
+    # Differential columns from advanced DataFrames — dynamic lookup
+    ADV_COLS_MAP = {
+        "special_teams": ["ev_xgd60", "pp_xgf60", "pk_xga60"],
+        "line_depth": ["depth_gap"],
+        "goalie_feats": ["goalie_gsax60", "starter_toi_share"],
+        "high_danger": ["high_danger_freq60"],
+        "toi_entropy": ["off_line_entropy", "def_pairing_entropy", "top_vs_top_share", "top_shelter_share", "goalie_entropy"],
+        "matchup_matrix": ["exploit_ability", "shutdown_resilience", "depth_insurance"],
+        "st_ev": ["net_st_ev", "pen_drawn60"],
+        "volatility": ["xgd60_std_game", "gsax_volatility", "blowout_rate", "close_game_rate"],
+    }
+    adv_diff_cols = {}
+    for src_name, src_df in advanced_features.items():
+        if src_name in ADV_COLS_MAP:
+            adv_diff_cols[src_name] = [c for c in ADV_COLS_MAP[src_name] if c in src_df.columns]
 
-    feat_df = pd.DataFrame(rows)
+    # Residualized columns
+    resid_diff_cols = []
+    if residualized_stats is not None:
+        resid_diff_cols = [c for c in residualized_stats.columns if c.endswith("_resid")]
+
+    # Start building the result DataFrame
+    feat_df = game[["game_id", "home_team", "away_team", "home_win"]].copy()
+
+    # BT strength differential (vectorized map)
+    bt_series = pd.Series(bt_strength)
+    feat_df["bt_diff"] = feat_df["home_team"].map(bt_series).fillna(0) - feat_df["away_team"].map(bt_series).fillna(0)
+
+    # Helper: merge a team-indexed DataFrame for home and away, compute diffs
+    def _merge_diffs(source_df, cols, suffix=""):
+        for col in cols:
+            if col not in source_df.columns:
+                continue
+            col_series = source_df[col]
+            out_name = f"{col}{suffix}_diff"
+            feat_df[out_name] = (feat_df["home_team"].map(col_series).fillna(0)
+                                 - feat_df["away_team"].map(col_series).fillna(0))
+
+    # Stat differentials
+    _merge_diffs(team_stats, stat_diff_cols)
+
+    # Advanced feature differentials
+    for src_name, cols in adv_diff_cols.items():
+        _merge_diffs(advanced_features[src_name], cols)
+
+    # Residualized feature differentials
+    if residualized_stats is not None:
+        _merge_diffs(residualized_stats, resid_diff_cols)
+
+    # RAPM feature differentials
+    if "rapm" in advanced_features:
+        rapm = advanced_features["rapm"]
+        _merge_diffs(rapm, ["rapm_attack", "rapm_defense", "rapm_topline_effect"])
+
+    # Interaction features (asymmetric matchups — not pure diffs)
+    if "special_teams" in advanced_features:
+        st = advanced_features["special_teams"]
+        pp_xgf60 = st["pp_xgf60"] if "pp_xgf60" in st.columns else pd.Series(dtype=float)
+        pk_xga60 = st["pk_xga60"] if "pk_xga60" in st.columns else pd.Series(dtype=float)
+        feat_df["pp_edge"] = (feat_df["home_team"].map(pp_xgf60).fillna(0)
+                              - feat_df["away_team"].map(pk_xga60).fillna(0))
+
+        if "pen60" in team_stats.columns:
+            pen60 = team_stats["pen60"]
+            feat_df["pp_opportunity"] = (feat_df["home_team"].map(pp_xgf60).fillna(0)
+                                         * feat_df["away_team"].map(pen60).fillna(0))
+            feat_df["pk_stress"] = (feat_df["away_team"].map(pp_xgf60).fillna(0)
+                                    * feat_df["home_team"].map(pen60).fillna(0))
+
+    if "goalie_feats" in advanced_features:
+        gk = advanced_features["goalie_feats"]
+        gk_gsax60 = gk["goalie_gsax60"] if "goalie_gsax60" in gk.columns else pd.Series(dtype=float)
+        if "xg_per_shot" in team_stats.columns:
+            feat_df["quality_vs_goalie"] = (feat_df["home_team"].map(team_stats["xg_per_shot"]).fillna(0)
+                                            - feat_df["away_team"].map(gk_gsax60).fillna(0))
+        else:
+            feat_df["quality_vs_goalie"] = -feat_df["away_team"].map(gk_gsax60).fillna(0)
+
+    # Uncertainty feature from bootstrap
+    if bt_std is not None:
+        bt_std_series = pd.Series(bt_std) if isinstance(bt_std, dict) else bt_std
+        h_std = feat_df["home_team"].map(bt_std_series).fillna(0)
+        a_std = feat_df["away_team"].map(bt_std_series).fillna(0)
+        feat_df["uncertainty"] = np.sqrt(h_std**2 + a_std**2)
+
+    # Drop helper columns
+    feat_df = feat_df.drop(columns=["home_team", "away_team"])
     return feat_df
 
 
 # ───────────────────── MODEL COMPARISON ─────────────────────────────
 
-def run_model_comparison(game, teams, n_splits=5):
+def run_model_comparison(game, teams, df_raw=None, n_splits=None, bt_kwargs=None):
     """
     Leakage-safe 5-fold CV comparison.
 
     IMPORTANT:
     - Feature engineering (team season stats, BT ratings) MUST be fit on the
       training fold only. Otherwise CV will be overly optimistic.
+    - Record-level features (special teams, line depth, goalie) are also
+      recomputed per fold from raw data.
     - Scaling MUST also be fit on training fold only.
     """
-    feature_names = [
-        "bt_diff",
-        "win_pct_diff",
-        "gd_pg_diff",
-        "xgd_pg_diff",
-        "xg_share_diff",
-        "xgd_per60_diff",
-        "shooting_pct_diff",
-        "save_pct_diff",
-        "pdo_diff",
-        "pim_pg_diff",
-    ]
+    if n_splits is None:
+        n_splits = CFG["cv"]["n_folds"]
+
+    # Feature tiers
+    enet_features = EXTENDED_FEATURES.copy()
+    gb_features = FULL_FEATURES.copy()
 
     y = game["home_win"].values
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=CFG["cv"]["random_state"])
     results = {}
 
     # Out-of-fold predictions for fair metric computation.
@@ -210,78 +272,189 @@ def run_model_comparison(game, teams, n_splits=5):
         "Baseline (fold home-rate)": np.zeros(len(game), dtype=float),
         "BT-only Logistic": np.zeros(len(game), dtype=float),
         "Elastic Net Logistic": np.zeros(len(game), dtype=float),
+        "Skellam (AD)": np.zeros(len(game), dtype=float),
     }
     if HAS_XGB:
         oof["XGBoost"] = np.zeros(len(game), dtype=float)
     else:
         oof["Gradient Boosting"] = np.zeros(len(game), dtype=float)
-    oof["Blended Ensemble"] = np.zeros(len(game), dtype=float)
+    oof["Stacked Ensemble"] = np.zeros(len(game), dtype=float)
 
-    # Models
-    from sklearn.linear_model import LogisticRegression
+    # Per-fold feature importance tracking
+    fold_enet_coefs = []
+    fold_gb_importances = []
+
     from sklearn.pipeline import Pipeline
 
-    for train_idx, test_idx in cv.split(np.zeros(len(game)), y):
+    # Build game_id -> raw data index for leak-safe fold splitting
+    if df_raw is not None:
+        raw_game_ids = set(df_raw["game_id"].unique())
+    else:
+        raw_game_ids = set()
+
+    for fold_i, (train_idx, test_idx) in enumerate(cv.split(np.zeros(len(game)), y)):
         train = game.iloc[train_idx].reset_index(drop=True)
         test = game.iloc[test_idx].reset_index(drop=True)
 
         # Fold-specific feature engineering (no leakage).
-        team_stats = build_team_season_stats(train)
-        bt = fit_bradley_terry(train, teams)
-        feat_tr = build_ml_features(train, team_stats, bt)
-        feat_te = build_ml_features(test, team_stats, bt)
+        team_stats = build_team_stats(train)
+        bt = fit_bt(train, teams, **(bt_kwargs or {}))
 
-        X_tr = feat_tr[feature_names].values
+        # Record-level features from training fold only
+        adv_dict = {}
+        resid_stats = None
+        if df_raw is not None:
+            train_game_ids = set(train["game_id"])
+            df_train = df_raw[df_raw["game_id"].isin(train_game_ids)]
+            rec_train = stack_records(df_train)  # Pre-compute once per fold
+            st_feats = build_special_teams(df_train, rec=rec_train)
+            ld_feats = build_line_depth(df_train, rec=rec_train)
+            gk_feats = build_goalie_features(df_train, rec=rec_train)
+            hd_feats = build_high_danger(df_train, rec=rec_train)
+            rapm_feats = build_rapm_features(df_train, teams, rec=rec_train)
+            te_feats = build_toi_entropy(df_train, rec=rec_train)
+            mm_feats = build_matchup_matrix(df_train, rec=rec_train)
+            stev_feats = build_st_expected_value(df_train, rec=rec_train)
+            vol_feats = build_volatility_features(df_train, train, rec=rec_train)
+
+            adv_dict = _build_advanced_dict(
+                special_teams=st_feats, line_depth=ld_feats,
+                goalie_feats=gk_feats, high_danger=hd_feats,
+                toi_entropy=te_feats, matchup_matrix=mm_feats,
+                st_ev=stev_feats if len(stev_feats) > 0 else None,
+                volatility=vol_feats, rapm=rapm_feats)
+
+            # Residualize features (per fold, using fold BT)
+            resid_base = team_stats.copy()
+            for adv_src_name, adv_cols in RESID_ADV_COLS.items():
+                src = adv_dict.get(adv_src_name)
+                if src is not None:
+                    for col in adv_cols:
+                        if col in src.columns:
+                            resid_base[col] = src[col]
+
+            all_resid_cols = RESID_STAT_COLS + [c for cols in RESID_ADV_COLS.values() for c in cols]
+            valid_cols = [c for c in all_resid_cols if c in resid_base.columns]
+            resid_stats = residualize_features(resid_base, bt, valid_cols)
+
+        feat_tr = build_ml_features(train, team_stats, bt, adv_dict, resid_stats)
+        feat_te = build_ml_features(test, team_stats, bt, adv_dict, resid_stats)
+
+        # Ensure all feature columns exist (fill missing with 0)
+        for col in gb_features:
+            if col not in feat_tr.columns:
+                feat_tr[col] = 0.0
+                feat_te[col] = 0.0
+
         y_tr = feat_tr["home_win"].values
-        X_te = feat_te[feature_names].values
 
         # Baseline: predict with training home win-rate.
         p0 = float(y_tr.mean())
         oof["Baseline (fold home-rate)"][test_idx] = p0
 
-        # BT-only logistic (single feature) with fold-scaling.
-        bt_col = feature_names.index("bt_diff")
-        bt_tr = X_tr[:, [bt_col]]
-        bt_te = X_te[:, [bt_col]]
+        # BT-only logistic (single feature) — use LogisticRegressionCV for fair comparison.
+        bt_tr = feat_tr[["bt_diff"]].values
+        bt_te = feat_te[["bt_diff"]].values
         lr_bt = Pipeline([
             ("scaler", StandardScaler()),
-            ("model", LogisticRegression(C=1.0, max_iter=2000)),
+            ("model", LogisticRegressionCV(Cs=10, cv=3, max_iter=2000, random_state=42)),
         ])
         lr_bt.fit(bt_tr, y_tr)
         oof["BT-only Logistic"][test_idx] = lr_bt.predict_proba(bt_te)[:, 1]
 
-        # Elastic Net logistic (all features) with fold-scaling and inner CV.
+        # Elastic Net logistic (extended features) with fold-scaling and inner CV.
+        X_tr_enet = feat_tr[enet_features].values
+        X_te_enet = feat_te[enet_features].values
         enet = Pipeline([
             ("scaler", StandardScaler()),
             ("model", LogisticRegressionCV(
                 Cs=20, cv=5, penalty="elasticnet", solver="saga",
-                l1_ratios=[0.1, 0.5, 0.9], max_iter=5000, random_state=42,
+                l1_ratios=[0.01, 0.1, 0.3, 0.5, 0.9], max_iter=5000, random_state=42,
             )),
         ])
-        enet.fit(X_tr, y_tr)
-        oof["Elastic Net Logistic"][test_idx] = enet.predict_proba(X_te)[:, 1]
+        enet.fit(X_tr_enet, y_tr)
+        oof["Elastic Net Logistic"][test_idx] = enet.predict_proba(X_te_enet)[:, 1]
+        fold_enet_coefs.append(np.abs(enet.named_steps["model"].coef_[0]))
 
-        # XGBoost / fallback GB (no scaling needed).
+        # XGBoost / fallback GB with hyperparameter tuning (full features).
+        # Option A symmetric augmentation: tune on original, refit on augmented.
+        X_tr_gb = feat_tr[gb_features].values
+        X_te_gb = feat_te[gb_features].values
+        use_sym = CFG.get("augmentation", {}).get("symmetric", False)
         if HAS_XGB:
-            xgb_model = xgb.XGBClassifier(
-                n_estimators=200, max_depth=3, learning_rate=0.05,
+            param_grid = {
+                "max_depth": [2, 3, 4],
+                "learning_rate": [0.03, 0.05, 0.1],
+                "n_estimators": [100, 200, 300],
+            }
+            xgb_base = xgb.XGBClassifier(
                 subsample=0.8, colsample_bytree=0.8,
                 reg_alpha=1.0, reg_lambda=2.0,
                 eval_metric="logloss", random_state=42,
             )
-            xgb_model.fit(X_tr, y_tr)
-            oof["XGBoost"][test_idx] = xgb_model.predict_proba(X_te)[:, 1]
+            gs = GridSearchCV(xgb_base, param_grid, cv=3, scoring="neg_brier_score",
+                              n_jobs=-1, refit=not use_sym)
+            gs.fit(X_tr_gb, y_tr)
+            if use_sym:
+                X_aug, y_aug = _symmetric_augment(X_tr_gb, y_tr)
+                final_model = xgb.XGBClassifier(
+                    **{**xgb_base.get_params(), **gs.best_params_})
+                final_model.fit(X_aug, y_aug)
+                oof["XGBoost"][test_idx] = final_model.predict_proba(X_te_gb)[:, 1]
+                fold_gb_importances.append(final_model.feature_importances_)
+            else:
+                oof["XGBoost"][test_idx] = gs.predict_proba(X_te_gb)[:, 1]
+                fold_gb_importances.append(gs.best_estimator_.feature_importances_)
         else:
-            gb = GradientBoostingClassifier(
-                n_estimators=200, max_depth=3, learning_rate=0.05,
+            param_grid = {
+                "max_depth": [2, 3, 4],
+                "learning_rate": [0.03, 0.05, 0.1],
+                "n_estimators": [100, 200, 300],
+            }
+            gb_base = GradientBoostingClassifier(
                 subsample=0.8, random_state=42,
             )
-            gb.fit(X_tr, y_tr)
-            oof["Gradient Boosting"][test_idx] = gb.predict_proba(X_te)[:, 1]
+            gs = GridSearchCV(gb_base, param_grid, cv=3, scoring="neg_brier_score",
+                              n_jobs=-1, refit=not use_sym)
+            gs.fit(X_tr_gb, y_tr)
+            if use_sym:
+                X_aug, y_aug = _symmetric_augment(X_tr_gb, y_tr)
+                final_model = GradientBoostingClassifier(
+                    **{**gb_base.get_params(), **gs.best_params_})
+                final_model.fit(X_aug, y_aug)
+                oof["Gradient Boosting"][test_idx] = final_model.predict_proba(X_te_gb)[:, 1]
+                fold_gb_importances.append(final_model.feature_importances_)
+            else:
+                oof["Gradient Boosting"][test_idx] = gs.predict_proba(X_te_gb)[:, 1]
+                fold_gb_importances.append(gs.best_estimator_.feature_importances_)
 
-    # Blend (computed from leakage-safe OOF preds).
-    p_ml = oof["XGBoost"] if HAS_XGB else oof["Gradient Boosting"]
-    oof["Blended Ensemble"] = 0.6 * oof["Elastic Net Logistic"] + 0.4 * p_ml
+        # Attack-Defense Skellam model (no ML — Poisson-based)
+        ad_model = fit_attack_defense(train, teams,
+                                       use_xg=CFG["attack_defense"]["use_xg"],
+                                       regularization=CFG["attack_defense"]["regularization"])
+        mean_toi = train["toi"].mean()
+        for ti in test_idx:
+            g = game.iloc[ti]
+            oof["Skellam (AD)"][ti] = skellam_predict_ad(
+                ad_model, g["home_team"], g["away_team"], toi=mean_toi)
+
+    # Stacked Ensemble: cross-fitted logistic stacking meta-learner over all OOF predictions
+    stack_models = ["BT-only Logistic", "Elastic Net Logistic", "Skellam (AD)"]
+    stack_models.append("XGBoost" if HAS_XGB else "Gradient Boosting")
+    stack_X = np.column_stack([oof[m] for m in stack_models])
+
+    # Nested CV for honest OOF predictions
+    meta_cv = StratifiedKFold(n_splits=n_splits, shuffle=True,
+                              random_state=CFG["cv"]["random_state"] + 100)
+    for meta_tr, meta_te in meta_cv.split(stack_X, y):
+        meta_fold = LogisticRegressionCV(Cs=10, cv=3, max_iter=2000, random_state=42)
+        meta_fold.fit(stack_X[meta_tr], y[meta_tr])
+        oof["Stacked Ensemble"][meta_te] = meta_fold.predict_proba(stack_X[meta_te])[:, 1]
+
+    # Refit on all for final predictions
+    meta_model = LogisticRegressionCV(Cs=10, cv=3, max_iter=2000, random_state=42)
+    meta_model.fit(stack_X, y)
+    print(f"  Stacked Ensemble meta-model coefs: {dict(zip(stack_models, meta_model.coef_[0].round(3)))}")
 
     # Summarize
     def _metrics(p):
@@ -296,13 +469,20 @@ def run_model_comparison(game, teams, n_splits=5):
     results["Baseline (fold home-rate)"] = _metrics(oof["Baseline (fold home-rate)"])
     results["BT-only Logistic"] = _metrics(oof["BT-only Logistic"])
     results["Elastic Net Logistic"] = _metrics(oof["Elastic Net Logistic"])
+    results["Skellam (AD)"] = _metrics(oof["Skellam (AD)"])
     if HAS_XGB:
         results["XGBoost"] = _metrics(oof["XGBoost"])
     else:
         results["Gradient Boosting"] = _metrics(oof["Gradient Boosting"])
-    results["Blended Ensemble"] = _metrics(oof["Blended Ensemble"])
+    results["Stacked Ensemble"] = _metrics(oof["Stacked Ensemble"])
 
-    return results, feature_names
+    # Aggregate per-fold importance
+    fold_importance = {
+        "enet_coefs": np.array(fold_enet_coefs) if fold_enet_coefs else None,
+        "gb_importances": np.array(fold_gb_importances) if fold_gb_importances else None,
+    }
+
+    return results, enet_features, gb_features, fold_importance
 
 
 # ───────────────────── FEATURE IMPORTANCE ───────────────────────────
@@ -332,37 +512,32 @@ def compute_feature_importance(X, y, feature_names):
         xgb_imp = pd.Series(
             xgb_model.feature_importances_, index=feature_names
         ).sort_values(ascending=False)
-
-        # SHAP if available
-        shap_values = None
-        if HAS_SHAP:
-            explainer = shap.TreeExplainer(xgb_model)
-            shap_values = explainer.shap_values(X)
     else:
         xgb_imp = None
-        shap_values = None
 
-    return enet_coefs, xgb_imp, shap_values, enet, scaler
+    return enet_coefs, xgb_imp, enet, scaler
 
 
 # ───────────────────── MATCHUP PREDICTION ───────────────────────────
 
-def predict_matchups_ml(matchups, team_stats, bt_strength, model, scaler, feature_names):
+def predict_matchups_ml(matchups, team_stats, bt_strength, model, scaler, feature_names,
+                        advanced_features=None, residualized_stats=None):
     """Predict Round 1 matchups using the best ML model."""
-    feature_cols = ["win_pct", "gd_pg", "xgd_pg", "xg_share", "xgd_per60",
-                    "shooting_pct", "save_pct", "pdo", "pim_pg"]
-    rows = []
-    for _, m in matchups.iterrows():
-        h, a = m["home_team"], m["away_team"]
-        row = {}
-        row["bt_diff"] = bt_strength.get(h, 0) - bt_strength.get(a, 0)
-        for col in feature_cols:
-            hv = team_stats.loc[h, col] if h in team_stats.index else 0
-            av = team_stats.loc[a, col] if a in team_stats.index else 0
-            row[f"{col}_diff"] = hv - av
-        rows.append(row)
+    # Build a minimal "game" DataFrame for build_ml_features
+    fake_game = matchups.copy()
+    fake_game["home_win"] = 0  # placeholder
+    if "game_id" not in fake_game.columns:
+        fake_game["game_id"] = range(len(fake_game))
 
-    X_new = pd.DataFrame(rows)[feature_names].values
+    feat_df = build_ml_features(fake_game, team_stats, bt_strength,
+                                advanced_features, residualized_stats)
+
+    # Ensure all feature columns exist
+    for col in feature_names:
+        if col not in feat_df.columns:
+            feat_df[col] = 0.0
+
+    X_new = feat_df[feature_names].values
     X_new_s = scaler.transform(X_new)
     probs = model.predict_proba(X_new_s)[:, 1]
 
@@ -390,11 +565,13 @@ def create_ml_dashboard(results, y, enet_coefs, xgb_imp, feature_names, output_d
     ax1 = fig.add_subplot(gs[0, 0])
     models = list(results.keys())
     accs = [results[m]["accuracy"] for m in models]
-    colors = ["#95a5a6", "#3498db", "#2ecc71", "#e74c3c", "#9b59b6"][:len(models)]
+    colors = ["#95a5a6", "#3498db", "#2ecc71", "#f39c12", "#e74c3c", "#9b59b6"][:len(models)]
     bars = ax1.barh(models, accs, color=colors, edgecolor="white", height=0.5)
     ax1.set_xlabel("5-Fold CV Accuracy")
     ax1.set_title("Model Accuracy Comparison", fontweight="bold")
-    ax1.set_xlim(0.45, 0.65)
+    acc_lo = max(0.0, min(accs) - 0.05)
+    acc_hi = min(1.0, max(accs) + 0.05)
+    ax1.set_xlim(acc_lo, acc_hi)
     for bar, acc in zip(bars, accs):
         ax1.text(acc + 0.003, bar.get_y() + bar.get_height()/2,
                  f"{acc:.1%}", va="center", fontsize=9)
@@ -408,22 +585,26 @@ def create_ml_dashboard(results, y, enet_coefs, xgb_imp, feature_names, output_d
     ax2.bar(x_pos - w/2, briers, w, label="Brier Score", color="#3498db", alpha=0.8)
     ax2.bar(x_pos + w/2, lls, w, label="Log-Loss", color="#e74c3c", alpha=0.8)
     ax2.set_xticks(x_pos)
-    ax2.set_xticklabels([m.split("(")[0].strip() for m in models], rotation=30, ha="right", fontsize=8)
+    ax2.set_xticklabels([m.split("(")[0].strip()[:12] for m in models], rotation=30, ha="right", fontsize=8)
     ax2.set_ylabel("Score (lower = better)")
     ax2.set_title("Brier Score & Log-Loss", fontweight="bold")
     ax2.legend(fontsize=8)
 
     # ── Panel 3: Calibration curves ──
     ax3 = fig.add_subplot(gs[0, 2])
-    ax3.plot([0, 1], [0, 1], "k--", alpha=0.5, label="Perfect")
-    for name, color in zip(["BT-only Logistic", "Elastic Net Logistic",
-                             "XGBoost" if HAS_XGB else "Gradient Boosting",
-                             "Blended Ensemble"],
-                            ["#3498db", "#2ecc71", "#e74c3c", "#9b59b6"]):
+    non_baseline = [n for n in results if n != "Baseline (fold home-rate)"]
+    all_model_probs = np.concatenate([results[name]["probs"] for name in non_baseline])
+    cal_lo = max(0.0, np.percentile(all_model_probs, 2) - 0.02)
+    cal_hi = min(1.0, np.percentile(all_model_probs, 98) + 0.02)
+    ax3.plot([cal_lo, cal_hi], [cal_lo, cal_hi], "k--", alpha=0.5, label="Perfect")
+    cal_models = ["BT-only Logistic", "Elastic Net Logistic", "Skellam (AD)",
+                  "XGBoost" if HAS_XGB else "Gradient Boosting", "Stacked Ensemble"]
+    cal_colors = ["#3498db", "#2ecc71", "#f39c12", "#e74c3c", "#9b59b6"]
+    for name, color in zip(cal_models, cal_colors):
         if name not in results:
             continue
         probs = results[name]["probs"]
-        bins = np.linspace(0.3, 0.75, 7)
+        bins = np.linspace(cal_lo, cal_hi, 7)
         bin_centers, bin_means = [], []
         for i in range(len(bins)-1):
             mask = (probs >= bins[i]) & (probs < bins[i+1])
@@ -436,14 +617,14 @@ def create_ml_dashboard(results, y, enet_coefs, xgb_imp, feature_names, output_d
     ax3.set_ylabel("Observed Win Rate")
     ax3.set_title("Calibration Curves", fontweight="bold")
     ax3.legend(fontsize=7, loc="upper left")
-    ax3.set_xlim(0.3, 0.75)
-    ax3.set_ylim(0.3, 0.85)
+    ax3.set_xlim(cal_lo, cal_hi)
+    ax3.set_ylim(cal_lo, cal_hi + 0.05)
 
     # ── Panel 4: Elastic Net coefficients ──
     ax4 = fig.add_subplot(gs[1, 0])
     top_enet = enet_coefs.head(10)
-    clean_names = [n.replace("_diff", "").replace("_", " ").title() for n in top_enet.index]
-    ax4.barh(clean_names[::-1], top_enet.values[::-1], color="#2ecc71", edgecolor="white")
+    clean_names_e = [n.replace("_diff", "").replace("_", " ").title() for n in top_enet.index]
+    ax4.barh(clean_names_e[::-1], top_enet.values[::-1], color="#2ecc71", edgecolor="white")
     ax4.set_xlabel("|Coefficient|")
     ax4.set_title("Elastic Net: Feature Importance", fontweight="bold")
 
@@ -489,10 +670,73 @@ def create_ml_dashboard(results, y, enet_coefs, xgb_imp, feature_names, output_d
     fig.suptitle("WHSDSC 2026 — ML Model Comparison Dashboard",
                  fontsize=15, fontweight="bold", y=0.98)
     fig.text(0.5, 0.005,
-             "5-Fold Stratified CV | Features: BT strength + xG + goals + shooting + save% + PDO + penalties",
+             "5-Fold Stratified CV | Tiered Features: Core(5) + Extended(22) + Full(35) | AD Skellam + Cross-Fitted Stacked Ensemble",
              ha="center", fontsize=8, color="gray")
 
     out = os.path.join(output_dir, "phase1_ml_comparison.png")
+    plt.savefig(out, dpi=200, bbox_inches="tight", facecolor="white")
+    plt.close()
+    return out
+
+
+def create_diagnostics_dashboard(X_enet, X_gb, y, enet_features, gb_features,
+                                 fold_importance, output_dir):
+    """Create ML diagnostics dashboard: per-fold importance, correlation heatmap."""
+    fig = plt.figure(figsize=(18, 6))
+    gs = GridSpec(1, 3, figure=fig, wspace=0.35)
+
+    # Panel 1: Feature correlation heatmap (full feature set)
+    ax1 = fig.add_subplot(gs[0, 0])
+    corr_matrix = np.corrcoef(X_gb.T)
+    clean_names = [n.replace("_diff", "").replace("_", " ").title() for n in gb_features]
+    im = ax1.imshow(corr_matrix, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+    ax1.set_xticks(range(len(gb_features)))
+    ax1.set_yticks(range(len(gb_features)))
+    ax1.set_xticklabels(clean_names, rotation=45, ha="right", fontsize=6)
+    ax1.set_yticklabels(clean_names, fontsize=6)
+    plt.colorbar(im, ax=ax1, shrink=0.8)
+    ax1.set_title("Feature Correlation (Full Tier)", fontweight="bold")
+
+    # Panel 2: Per-fold Elastic Net coefficients (mean +/- std)
+    ax2 = fig.add_subplot(gs[0, 1])
+    clean_enet = [n.replace("_diff", "").replace("_", " ").title() for n in enet_features]
+    if fold_importance["enet_coefs"] is not None:
+        coef_arr = fold_importance["enet_coefs"]
+        mean_coefs = coef_arr.mean(axis=0)
+        std_coefs = coef_arr.std(axis=0)
+        order = np.argsort(mean_coefs)[::-1]
+        ax2.barh(
+            [clean_enet[i] for i in order][::-1],
+            mean_coefs[order][::-1],
+            xerr=std_coefs[order][::-1],
+            color="#2ecc71", edgecolor="white", capsize=3
+        )
+        ax2.set_xlabel("|Coefficient| (mean +/- std across folds)")
+        ax2.set_title("Per-Fold Elastic Net Importance", fontweight="bold")
+    else:
+        ax2.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax2.transAxes)
+
+    # Panel 3: Per-fold GB importances (mean +/- std)
+    ax3 = fig.add_subplot(gs[0, 2])
+    clean_gb = [n.replace("_diff", "").replace("_", " ").title() for n in gb_features]
+    if fold_importance["gb_importances"] is not None:
+        imp_arr = fold_importance["gb_importances"]
+        mean_imp = imp_arr.mean(axis=0)
+        std_imp = imp_arr.std(axis=0)
+        order = np.argsort(mean_imp)[::-1]
+        ax3.barh(
+            [clean_gb[i] for i in order][::-1],
+            mean_imp[order][::-1],
+            xerr=std_imp[order][::-1],
+            color="#e74c3c", edgecolor="white", capsize=3
+        )
+        ax3.set_xlabel("Importance (mean +/- std across folds)")
+        ax3.set_title("Per-Fold Boosting Importance", fontweight="bold")
+    else:
+        ax3.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax3.transAxes)
+
+    fig.suptitle("WHSDSC 2026 — ML Diagnostics", fontsize=14, fontweight="bold", y=1.02)
+    out = os.path.join(output_dir, "phase1_ml_diagnostics.png")
     plt.savefig(out, dpi=200, bbox_inches="tight", facecolor="white")
     plt.close()
     return out
@@ -509,31 +753,73 @@ def main():
     df, matchups = load_data()
 
     print("[2/7] Building game features...")
-    game = build_game_features(df)
+    game = build_game_level(df)
     teams = sorted(game["home_team"].unique().tolist())
-    team_stats = build_team_season_stats(game)
+    team_stats = build_team_stats(game)
+
+    # Advanced record-level features (full dataset, for final predictions)
+    rec_full = stack_records(df)  # Pre-compute once
+    st_feats = build_special_teams(df, rec=rec_full)
+    ld_feats = build_line_depth(df, rec=rec_full)
+    gk_feats = build_goalie_features(df, rec=rec_full)
+    hd_feats = build_high_danger(df, rec=rec_full)
 
     print("[3/7] Fitting Bradley-Terry...")
-    bt = fit_bradley_terry(game, teams)
+    bt = fit_bt(game, teams)
+
+    # Build RAPM and new features on full data for final predictions
+    rapm_feats = build_rapm_features(df, teams, rec=rec_full)
+    te_feats = build_toi_entropy(df, rec=rec_full)
+    mm_feats = build_matchup_matrix(df, rec=rec_full)
+    stev_feats = build_st_expected_value(df, rec=rec_full)
+    vol_feats = build_volatility_features(df, game, rec=rec_full)
+
+    # Build advanced features dict
+    adv_dict = _build_advanced_dict(
+        special_teams=st_feats, line_depth=ld_feats,
+        goalie_feats=gk_feats, high_danger=hd_feats,
+        toi_entropy=te_feats, matchup_matrix=mm_feats,
+        st_ev=stev_feats if len(stev_feats) > 0 else None,
+        volatility=vol_feats, rapm=rapm_feats)
+
+    # Residualize features on full data for final predictions
+    resid_base = team_stats.copy()
+    for adv_src_name, adv_cols in RESID_ADV_COLS.items():
+        src = adv_dict.get(adv_src_name)
+        if src is not None:
+            for col in adv_cols:
+                if col in src.columns:
+                    resid_base[col] = src[col]
+    all_resid_cols = RESID_STAT_COLS + [c for cols in RESID_ADV_COLS.values() for c in cols]
+    valid_cols = [c for c in all_resid_cols if c in resid_base.columns]
+    resid_stats = residualize_features(resid_base, bt, valid_cols)
 
     print("[4/7] Building ML feature matrix...")
-    feat_df = build_ml_features(game, team_stats, bt)
-    print(f"  {len(feat_df)} games, {len(feat_df.columns)-2} features")
+    feat_df = build_ml_features(game, team_stats, bt, adv_dict, resid_stats)
+
+    # Ensure all feature columns exist
+    for col in FULL_FEATURES:
+        if col not in feat_df.columns:
+            feat_df[col] = 0.0
+
+    print(f"  {len(feat_df)} games, {len(feat_df.columns)-2} total columns")
 
     print("[5/7] Running 5-fold CV model comparison...")
-    results, feature_names = run_model_comparison(game, teams)
-    X = feat_df[feature_names].values
+    results, enet_features, gb_features, fold_importance = run_model_comparison(
+        game, teams, df_raw=df)
+
+    X_enet = feat_df[enet_features].values
+    X_gb = feat_df[gb_features].values
     y = feat_df["home_win"].values
 
-    print("\n  ┌─────────────────────────┬──────────┬──────────┬──────────┐")
-    print("  │ Model                   │ Accuracy │ Log-Loss │ Brier    │")
-    print("  ├─────────────────────────┼──────────┼──────────┼──────────┤")
+    print(f"\n  {'Model':<25} {'Accuracy':>10} {'Log-Loss':>10} {'Brier':>10}")
+    print(f"  {'─'*25} {'─'*10} {'─'*10} {'─'*10}")
     for name, r in results.items():
-        print(f"  │ {name:<23} │ {r['accuracy']:>7.1%}  │ {r['log_loss']:>8.4f} │ {r['brier']:>8.4f} │")
-    print("  └─────────────────────────┴──────────┴──────────┴──────────┘")
+        print(f"  {name:<25} {r['accuracy']:>9.1%}  {r['log_loss']:>9.4f} {r['brier']:>9.4f}")
 
     print("\n[6/7] Computing feature importance...")
-    enet_coefs, xgb_imp, shap_values, enet_model, scaler = compute_feature_importance(X, y, feature_names)
+    enet_coefs, xgb_imp, enet_model, scaler = compute_feature_importance(
+        X_enet, y, enet_features)
 
     print("  Elastic Net top 3:", ", ".join(f"{n}({v:.3f})" for n, v in enet_coefs.head(3).items()))
     if xgb_imp is not None:
@@ -542,12 +828,24 @@ def main():
     print("[7/7] Generating outputs...")
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # ML matchup predictions using best interpretable model (Elastic Net)
-    ml_matchups = predict_matchups_ml(matchups, team_stats, bt, enet_model, scaler, feature_names)
+    # Select best model by Brier score for matchup predictions
+    best_brier_model = min(
+        {k: v for k, v in results.items() if k != "Baseline (fold home-rate)"}.items(),
+        key=lambda x: x[1]["brier"]
+    )
+    print(f"  Best model (Brier): {best_brier_model[0]} ({best_brier_model[1]['brier']:.4f})")
+
+    # ML matchup predictions using best calibrated model (Elastic Net retrained on all data)
+    ml_matchups = predict_matchups_ml(matchups, team_stats, bt, enet_model, scaler,
+                                      enet_features, adv_dict, resid_stats)
     ml_matchups.to_csv(os.path.join(OUTPUT_DIR, "phase1_ml_matchups.csv"), index=False)
 
     # Dashboard
-    viz = create_ml_dashboard(results, y, enet_coefs, xgb_imp, feature_names, OUTPUT_DIR)
+    viz = create_ml_dashboard(results, y, enet_coefs, xgb_imp, enet_features, OUTPUT_DIR)
+
+    # Diagnostics dashboard
+    diag_viz = create_diagnostics_dashboard(X_enet, X_gb, y, enet_features, gb_features,
+                                            fold_importance, OUTPUT_DIR)
 
     # Results summary
     summary = "# ML Model Comparison Results\n\n"
@@ -556,6 +854,11 @@ def main():
     summary += "|-------|----------|----------|-------------|\n"
     for name, r in results.items():
         summary += f"| {name} | {r['accuracy']:.1%} | {r['log_loss']:.4f} | {r['brier']:.4f} |\n"
+
+    summary += "\n## Feature Tiers\n\n"
+    summary += f"- **Core** ({len(CORE_FEATURES)}): {', '.join(CORE_FEATURES)}\n"
+    summary += f"- **Extended** ({len(EXTENDED_FEATURES)}): adds {', '.join(set(EXTENDED_FEATURES) - set(CORE_FEATURES))}\n"
+    summary += f"- **Full** ({len(FULL_FEATURES)}): adds {', '.join(set(FULL_FEATURES) - set(EXTENDED_FEATURES))}\n"
 
     summary += "\n## Feature Importance (Elastic Net |Coefficients|)\n\n"
     summary += "| Feature | |Coefficient| |\n|---------|-------------|\n"
@@ -595,6 +898,7 @@ def main():
         f.write(summary)
 
     print(f"\n  Dashboard:  {viz}")
+    print(f"  Diagnostics: {diag_viz}")
     print(f"  Matchups:   output/phase1_ml_matchups.csv")
     print(f"  Results:    output/phase1_ml_results.md")
     print("\n" + "=" * 60)

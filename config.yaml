@@ -1,0 +1,56 @@
+bt:
+  ot_weight: 0.5
+  max_iter: 300
+  tol: 1.0e-8
+  regularization: 0.01
+
+rankings:
+  weights:
+    bt_strength: 0.40
+    xgd_per60: 0.30
+    xg_share: 0.10
+    gd_pg: 0.10
+    win_pct: 0.10
+
+cv:
+  n_folds: 5
+  random_state: 42
+
+blend:
+  enet_weight: 0.6  # overridden by Phase 2.5 auto-optimization
+
+disparity:
+  min_toi_seconds: 1000
+  ratio_clip: [0.5, 3.0]
+
+prediction:
+  prob_clip: [0.01, 0.99]
+  bootstrap_integrate: true
+  uncertainty_shrink_k: 0.0   # 0 = disabled; auto-tuned
+
+bt_tuning:
+  ot_weight_grid: [0.0, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0]
+  regularization_grid: [0.0001, 0.0003, 0.001, 0.003, 0.01, 0.03]
+  # calibration_methods: ['platt', 'isotonic']  # removed: downstream always uses platt
+  n_inner_folds: 3
+
+attack_defense:
+  use_xg: true
+  regularization: 0.01
+
+rapm:
+  regularization: 1.0
+  include_goalies: true
+  min_toi_unit: 200  # minimum TOI (seconds) for a unit to be included in RAPM
+
+augmentation:
+  symmetric: true  # symmetric augmentation for tree models
+
+matchup_matrix:
+  min_toi: 300  # minimum TOI (seconds) per matchup cell before shrinkage fill
+
+shrinkage:
+  K: 500  # seconds of TOI; higher = more regression to league mean
+
+high_danger:
+  threshold: 0.20  # max_xg threshold for "high danger" classification

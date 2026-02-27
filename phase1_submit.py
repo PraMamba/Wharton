@@ -16,21 +16,46 @@ Optimizations over previous versions:
 
 import os
 import re
-import zipfile
 import warnings
+from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-from scipy.optimize import minimize
 from scipy.special import expit
 
-warnings.filterwarnings("ignore")
+from core.data import load_data, build_game_level
+from core.bt import fit_bt, compute_sos, bootstrap_bt
+from core.stats import build_team_stats
+from core.advanced import build_special_teams, build_line_depth, build_goalie_features, build_high_danger, stack_records
+from core.config import CFG
+from core.model import (
+    CVResult, build_rankings, fit_logistic,
+    cross_validate_bt, predict_matchups, compute_ece,
+    tune_bt_hyperparams, tune_uncertainty_shrink_k,
+    _fit_calibration,
+)
 
-ZIP_PATH = "drive-download-20260205T132825Z-1-001.zip"
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*lbfgs.*", category=UserWarning)
+
 OUTPUT_DIR = "output/submission"
+
+
+@dataclass
+class ReportMetrics:
+    """Bundle of CV and baseline metrics for write_submission_report."""
+    train_acc: float
+    cv_acc: float
+    cv_std: float
+    cv_ll: float
+    cv_brier: float
+    base_acc: float
+    base_ll: float
+    base_brier: float
+    base_home_rate: float
 
 
 def get_team_png_basename():
@@ -44,255 +69,14 @@ def get_team_png_basename():
     return name or "TeamName"
 
 
-# ═══════════════════════ DATA ═══════════════════════════════════════
-
-def load_data():
-    os.makedirs("output", exist_ok=True)
-    for fn in ["whl_2025.csv", "WHSDSC_Rnd1_matchups.xlsx"]:
-        out = os.path.join("output", fn)
-        if not os.path.exists(out):
-            with zipfile.ZipFile(ZIP_PATH) as zf:
-                zf.extract(fn, "output")
-    df = pd.read_csv("output/whl_2025.csv")
-    matchups = pd.read_excel("output/WHSDSC_Rnd1_matchups.xlsx")
-    return df, matchups
-
-
-def build_game_level(df):
-    game = df.groupby("game_id").agg(
-        home_team=("home_team", "first"), away_team=("away_team", "first"),
-        home_goals=("home_goals", "sum"), away_goals=("away_goals", "sum"),
-        home_xg=("home_xg", "sum"), away_xg=("away_xg", "sum"),
-        home_shots=("home_shots", "sum"), away_shots=("away_shots", "sum"),
-        home_max_xg=("home_max_xg", "max"), away_max_xg=("away_max_xg", "max"),
-        home_pm=("home_penalty_minutes", "sum"), away_pm=("away_penalty_minutes", "sum"),
-        went_ot=("went_ot", "first"), toi=("toi", "sum"),
-    ).reset_index()
-    game["home_win"] = (game["home_goals"] > game["away_goals"]).astype(int)
-    # Validation: Ensure no draws (or handle them if they exist)
-    if (game["home_goals"] == game["away_goals"]).any():
-        raise ValueError("Dataset contains draws, but the pipeline assumes a winner is always determined.")
-    return game
-
-
-# ═══════════════════════ OT-AWARE BRADLEY-TERRY ═════════════════════
-
-def fit_bt_ot_aware(game, teams, ot_weight=0.5, max_iter=300, tol=1e-8):
-    """
-    Bradley-Terry with OT downweighting.
-    OT games count as half a win — the losing team was close to winning,
-    so the signal is weaker. This prevents the model from treating
-    a coin-flip OT result as equivalent to a dominant regulation win.
-    """
-    team_idx = {t: i for i, t in enumerate(teams)}
-    n = len(teams)
-    strength = np.zeros(n)
-
-    for _ in range(max_iter):
-        grad = np.zeros(n)
-        hess = np.zeros(n)
-        for _, row in game.iterrows():
-            i, j = team_idx[row["home_team"]], team_idx[row["away_team"]]
-            p = expit(strength[i] - strength[j])
-            y = row["home_win"]
-            w = ot_weight if row["went_ot"] == 1 else 1.0
-            grad[i] += w * (y - p)
-            grad[j] -= w * (y - p)
-            fisher = w * p * (1 - p)
-            hess[i] -= fisher
-            hess[j] -= fisher
-
-        hess = np.clip(hess, None, -1e-6)
-        delta = -grad / hess
-        delta -= delta.mean()
-        strength += 0.5 * delta
-        if np.max(np.abs(delta)) < tol:
-            break
-    else:
-        print(f"Warning: BT model did not converge after {max_iter} iterations (delta={np.max(np.abs(delta)):.2e})")
-
-    strength -= strength.mean()
-    return dict(zip(teams, strength))
-
-
-# ═══════════════════════ TEAM STATS ═════════════════════════════════
-
-def build_team_stats(game):
-    home = game[["game_id","home_team","away_team","home_goals","away_goals",
-                  "home_xg","away_xg","home_shots","away_shots","home_win","toi",
-                  "home_max_xg","away_max_xg","home_pm","away_pm"]].copy()
-    home.columns = ["gid","team","opp","gf","ga","xgf","xga","sf","sa","win","toi",
-                     "max_xg_for","max_xg_against","pm_taken","pm_drawn"]
-    away = game[["game_id","away_team","home_team","away_goals","home_goals",
-                  "away_xg","home_xg","away_shots","home_shots","home_win","toi",
-                  "away_max_xg","home_max_xg","away_pm","home_pm"]].copy()
-    away.columns = ["gid","team","opp","gf","ga","xgf","xga","sf","sa","hw","toi",
-                     "max_xg_for","max_xg_against","pm_taken","pm_drawn"]
-    away["win"] = (away["hw"] == 0).astype(int)
-    away.drop(columns=["hw"], inplace=True)
-    tg = pd.concat([home, away], ignore_index=True)
-    stats = tg.groupby("team").agg(
-        games=("gid","count"), wins=("win","sum"),
-        gf=("gf","sum"), ga=("ga","sum"),
-        xgf=("xgf","sum"), xga=("xga","sum"),
-        sf=("sf","sum"), sa=("sa","sum"), toi=("toi","sum"),
-        pm_taken=("pm_taken","sum"), pm_drawn=("pm_drawn","sum"),
-    )
-    stats["win_pct"] = stats["wins"] / stats["games"]
-    stats["gd_pg"] = (stats["gf"] - stats["ga"]) / stats["games"]
-    # Data dictionary: toi is seconds. per60 = per 60 minutes = per 3600 seconds.
-    # Protect against division by zero throughout
-    toi_hours = stats["toi"] / 3600
-    stats["xgd_per60"] = np.where(toi_hours > 0, (stats["xgf"] - stats["xga"]) / toi_hours, 0)
-    total_xg = stats["xgf"] + stats["xga"]
-    stats["xg_share"] = np.where(total_xg > 0, stats["xgf"] / total_xg, 0.5)
-    stats["save_pct"] = np.where(stats["sa"] > 0, 1 - (stats["ga"] / stats["sa"]), 0)
-    stats["shooting_pct"] = np.where(stats["sf"] > 0, stats["gf"] / stats["sf"], 0)
-    stats["pdo"] = stats["shooting_pct"] + stats["save_pct"]
-    # Goaltending: GSAx/game = (xGA - GA) / games. Positive = goalie saves more than expected.
-    stats["gsax_pg"] = (stats["xga"] - stats["ga"]) / stats["games"]
-    # Shot quality: xG per shot (offensive chance quality).
-    stats["xg_per_shot"] = np.where(stats["sf"] > 0, stats["xgf"] / stats["sf"], 0)
-    # Discipline: penalty minutes per game, penalty differential per game.
-    stats["pim_pg"] = stats["pm_taken"] / stats["games"]
-    stats["pen_diff_pg"] = (stats["pm_drawn"] - stats["pm_taken"]) / stats["games"]
-    return stats
-
-
-def compute_sos(game, bt):
-    recs = []
-    for _, r in game.iterrows():
-        recs.append({"team": r["home_team"], "os": bt[r["away_team"]]})
-        recs.append({"team": r["away_team"], "os": bt[r["home_team"]]})
-    return pd.DataFrame(recs).groupby("team")["os"].mean()
-
-
-# ═══════════════════════ RANKINGS ═══════════════════════════════════
-
-def build_rankings(stats, bt, sos):
-    r = stats.copy()
-    r["bt_strength"] = r.index.map(bt)
-    r["sos"] = r.index.map(sos)
-    # Weights validated by ML experiment: BT is dominant predictor
-    components = {"bt_strength": 0.40, "xgd_per60": 0.30, "xg_share": 0.10,
-                  "gd_pg": 0.10, "win_pct": 0.10}
-    for col in components:
-        m, s = r[col].mean(), r[col].std(ddof=0)
-        r[f"z_{col}"] = (r[col] - m) / s if s > 0 else 0
-    r["composite"] = sum(w * r[f"z_{c}"] for c, w in components.items())
-    r = r.sort_values("composite", ascending=False).reset_index()
-    r["rank"] = range(1, len(r) + 1)
-    return r
-
-
-# ═══════════════════════ WIN PROBABILITY ════════════════════════════
-
-def fit_logistic(game, bt):
-    """BT-only logistic (interpretable, stable, easy to audit)."""
-    diffs = np.array([bt[r["home_team"]] - bt[r["away_team"]] for _, r in game.iterrows()])
-    y = game["home_win"].values
-
-    def neg_ll(params):
-        a, b = params
-        p = np.clip(expit(a + b * diffs), 1e-8, 1 - 1e-8)
-        return -(y * np.log(p) + (1 - y) * np.log(1 - p)).mean()
-
-    res = minimize(neg_ll, [0.2, 1.0], method="Nelder-Mead")
-    a, b = res.x
-
-    p_train = expit(a + b * diffs)
-    acc = ((p_train >= 0.5).astype(int) == y).mean()
-    ll = neg_ll(res.x)
-    brier = np.mean((p_train - y) ** 2)
-    return a, b, acc, ll, brier
-
-
-def cross_validate_bt(game, teams, n_folds=5):
-    """5-fold CV on BT-only logistic."""
-    idx = np.arange(len(game))
-    np.random.seed(42)
-    np.random.shuffle(idx)
-    folds = np.array_split(idx, n_folds)
-    accs, lls, briers = [], [], []
-    base_accs, base_lls, base_briers = [], [], []
-    oof_pred = np.full(len(game), np.nan, dtype=float)
-    oof_true = game["home_win"].values.astype(int, copy=True)
-    for fold in range(n_folds):
-        test_idx = folds[fold]
-        train_idx = np.concatenate([folds[f] for f in range(n_folds) if f != fold])
-        train = game.iloc[train_idx]
-        test = game.iloc[test_idx]
-
-        # Baseline: predict with training home-win rate (leakage-safe).
-        y_tr_base = train["home_win"].values
-        y_te_base = test["home_win"].values
-        p_base = np.full(len(y_te_base), y_tr_base.mean(), dtype=float)
-        p_base = np.clip(p_base, 1e-8, 1 - 1e-8)
-        base_accs.append(((p_base >= 0.5).astype(int) == y_te_base).mean())
-        base_lls.append(
-            -(
-                y_te_base * np.log(p_base)
-                + (1 - y_te_base) * np.log(1 - p_base)
-            ).mean()
-        )
-        base_briers.append(np.mean((p_base - y_te_base) ** 2))
-
-        bt = fit_bt_ot_aware(train, teams)
-        diffs_tr = np.array([bt[r["home_team"]] - bt[r["away_team"]] for _, r in train.iterrows()])
-        y_tr = train["home_win"].values
-
-        def neg_ll(params):
-            a, b = params
-            p = np.clip(expit(a + b * diffs_tr), 1e-8, 1 - 1e-8)
-            return -(y_tr * np.log(p) + (1 - y_tr) * np.log(1 - p)).mean()
-
-        res = minimize(neg_ll, [0.2, 1.0], method="Nelder-Mead")
-        a, b = res.x
-
-        diffs_te = np.array([bt.get(r["home_team"], 0) - bt.get(r["away_team"], 0) for _, r in test.iterrows()])
-        y_te = test["home_win"].values
-        p_te = expit(a + b * diffs_te)
-        oof_pred[test_idx] = p_te
-        accs.append(((p_te >= 0.5).astype(int) == y_te).mean())
-        lls.append(-(y_te * np.log(np.clip(p_te, 1e-8, 1-1e-8)) + (1-y_te) * np.log(np.clip(1-p_te, 1e-8, 1-1e-8))).mean())
-        briers.append(np.mean((p_te - y_te) ** 2))
-    if np.isnan(oof_pred).any():
-        # Should not happen, but keep pipeline resilient.
-        fill = float(oof_true.mean())
-        oof_pred = np.where(np.isnan(oof_pred), fill, oof_pred)
-    return (
-        np.mean(accs),
-        np.std(accs),
-        np.mean(lls),
-        np.mean(briers),
-        np.mean(base_accs),
-        np.mean(base_lls),
-        np.mean(base_briers),
-        oof_pred,
-        oof_true,
-    )
-
-
-def predict_matchups(matchups, bt, a, b):
-    r = matchups.copy()
-    r["str_home"] = r["home_team"].map(bt)
-    r["str_away"] = r["away_team"].map(bt)
-    r["str_diff"] = r["str_home"] - r["str_away"]
-    # Clip away from {0,1} to avoid log-loss blowups if a downstream scorer uses log-loss.
-    p = np.clip(expit(a + b * r["str_diff"]), 0.01, 0.99)
-    r["home_win_prob"] = p.round(4)
-    r["predicted_winner"] = np.where(r["home_win_prob"] >= 0.5, r["home_team"], r["away_team"])
-    return r[["game", "game_id", "home_team", "away_team", "home_win_prob", "predicted_winner"]]
-
 
 # ═══════════════════════ LINE DISPARITY ═════════════════════════════
 
-def build_line_disparity(df):
-    home = df[["home_team","home_off_line","away_def_pairing","home_xg","toi"]].copy()
-    home.columns = ["team","line","opp_def","xgf","toi"]
-    away = df[["away_team","away_off_line","home_def_pairing","away_xg","toi"]].copy()
-    away.columns = ["team","line","opp_def","xgf","toi"]
-    lines = pd.concat([home, away], ignore_index=True)
+def build_line_disparity(df, rec=None):
+    if rec is None:
+        rec = stack_records(df)
+    lines = rec[["team", "off_line", "opp_def_pairing", "xg_f", "toi"]].copy()
+    lines.columns = ["team", "line", "opp_def", "xgf", "toi"]
     # Focus on even-strength-style matchups: first/second lines vs first/second defensive pairings.
     # Exclude power play/penalty kill and empty-net segments.
     es = lines[
@@ -312,9 +96,12 @@ def build_line_disparity(df):
     es["diff"] = es["diff"].fillna(1.0).replace(0, 1.0)  # Ensure no zero divisors
     es["adj_xgf"] = es["xgf"] / es["diff"]
 
+    min_toi = CFG["disparity"]["min_toi_seconds"]
     ls = es.groupby(["team","line"]).agg(rxg=("xgf","sum"), axg=("adj_xgf","sum"), t=("toi","sum"))
-    ls["raw60"] = np.where(ls["t"] > 0, (ls["rxg"]/ls["t"])*3600, np.nan)
-    ls["adj60"] = np.where(ls["t"] > 0, (ls["axg"]/ls["t"])*3600, np.nan)
+    # Filter out lines with insufficient TOI to avoid noisy ratios
+    ls.loc[ls["t"] < min_toi, ["rxg", "axg"]] = np.nan
+    ls["raw60"] = np.where(ls["t"] >= min_toi, (ls["rxg"]/ls["t"])*3600, np.nan)
+    ls["adj60"] = np.where(ls["t"] >= min_toi, (ls["axg"]/ls["t"])*3600, np.nan)
 
     pr = ls["raw60"].unstack("line")
     pa = ls["adj60"].unstack("line")
@@ -326,7 +113,11 @@ def build_line_disparity(df):
         "raw_ratio": pr["first_off"] / raw_second,
         "first_adj": pa["first_off"], "second_adj": pa["second_off"],
         "adj_ratio": pa["first_off"] / adj_second,
-    }).reset_index().sort_values("adj_ratio", ascending=False)
+    }).reset_index()
+    ratio_lo, ratio_hi = CFG["disparity"]["ratio_clip"]
+    disp["raw_ratio"] = disp["raw_ratio"].clip(ratio_lo, ratio_hi)
+    disp["adj_ratio"] = disp["adj_ratio"].clip(ratio_lo, ratio_hi)
+    disp = disp.sort_values("adj_ratio", ascending=False)
     return disp
 
 
@@ -334,6 +125,7 @@ def build_line_disparity(df):
 
 def create_submission_viz(rankings, disparity, output_dir):
     """Single competition-grade PNG for Phase 1c submission."""
+    from adjustText import adjust_text
     plt.rcParams.update({"font.size": 11, "font.family": "sans-serif",
                          "axes.spines.top": False, "axes.spines.right": False})
     fig, ax = plt.subplots(figsize=(10, 7))
@@ -352,18 +144,17 @@ def create_submission_viz(rankings, disparity, output_dir):
         yp = np.polyval(coef, x[m])
         r2 = 1 - np.sum((y[m]-yp)**2) / np.sum((y[m]-y[m].mean())**2) if np.sum((y[m]-y[m].mean())**2) > 0 else 0
 
-    for _, row in pdf.nlargest(5, "composite").iterrows():
-        ax.annotate(row["team"].replace("_"," ").title(),
-                    (row["adj_ratio"], row["composite"]),
-                    textcoords="offset points", xytext=(8,8), fontsize=9.5,
-                    fontweight="bold", color="#2c3e50",
-                    arrowprops=dict(arrowstyle="-", color="gray", alpha=0.3))
-    for _, row in pdf.nsmallest(3, "composite").iterrows():
-        ax.annotate(row["team"].replace("_"," ").title(),
-                    (row["adj_ratio"], row["composite"]),
-                    textcoords="offset points", xytext=(8,-12), fontsize=9.5,
-                    color="#c0392b",
-                    arrowprops=dict(arrowstyle="-", color="gray", alpha=0.3))
+    # Label collision avoidance using adjustText
+    texts = []
+    label_rows = pd.concat([pdf.nlargest(5, "composite"), pdf.nsmallest(3, "composite")])
+    for _, row in label_rows.iterrows():
+        is_top = row["composite"] >= pdf["composite"].median()
+        texts.append(ax.text(
+            row["adj_ratio"], row["composite"],
+            row["team"].replace("_"," ").title(),
+            fontsize=9.5, fontweight="bold" if is_top else "normal",
+            color="#2c3e50" if is_top else "#c0392b"))
+    adjust_text(texts, ax=ax, arrowprops=dict(arrowstyle="-", color="gray", alpha=0.3))
 
     ax.set_xlabel("Adjusted Offensive Line Quality Disparity\n"
                   "(1st Line xG/60 \u00f7 2nd Line xG/60, adjusted for defensive matchup difficulty)", fontsize=11)
@@ -425,16 +216,21 @@ def create_full_dashboard(rankings, disparity, matchups, cal_data, output_dir):
 
     # P2: Calibration
     ax2 = fig.add_subplot(gs[0, 2])
-    ax2.plot([0.3, 0.8], [0.3, 0.8], "k--", alpha=0.5, label="Perfect")
     if cal_data:
         cd = pd.DataFrame(cal_data)
+        cal_lo_d = max(0.0, cd["pred"].min() - 0.05)
+        cal_hi_d = min(1.0, cd["pred"].max() + 0.05)
+        ax2.plot([cal_lo_d, cal_hi_d], [cal_lo_d, cal_hi_d], "k--", alpha=0.5, label="Perfect")
         ax2.scatter(cd["pred"], cd["obs"], s=cd["n"]/2, c="#3498db", edgecolors="white", zorder=3)
         for _, c in cd.iterrows():
             ax2.annotate(f"n={int(c['n'])}", (c["pred"], c["obs"]),
                          textcoords="offset points", xytext=(5,5), fontsize=7)
+        ax2.set_xlim(cal_lo_d, cal_hi_d); ax2.set_ylim(cal_lo_d, cal_hi_d + 0.05)
+    else:
+        ax2.plot([0, 1], [0, 1], "k--", alpha=0.5, label="Perfect")
     ax2.set_xlabel("Predicted"); ax2.set_ylabel("Observed")
     ax2.set_title("Probability Calibration", fontsize=10, fontweight="bold")
-    ax2.set_xlim(0.3, 0.8); ax2.set_ylim(0.3, 0.85); ax2.legend(fontsize=7)
+    ax2.legend(fontsize=7)
 
     # P3: Rankings bar
     ax3 = fig.add_subplot(gs[1, 0])
@@ -456,7 +252,10 @@ def create_full_dashboard(rankings, disparity, matchups, cal_data, output_dir):
         color=[plt.cm.viridis(p) for p in ms["home_win_prob"]],
         edgecolor="white", height=0.55)
     ax4.axvline(0.5, color="gray", lw=1, ls="--", alpha=0.7)
-    ax4.set_xlabel("Home Win Probability"); ax4.set_xlim(0.3, 0.85)
+    ax4.set_xlabel("Home Win Probability")
+    prob_lo_d = max(0, ms["home_win_prob"].min() - 0.05)
+    prob_hi_d = min(1, ms["home_win_prob"].max() + 0.05)
+    ax4.set_xlim(prob_lo_d, prob_hi_d)
     ax4.set_title("Round 1 Predictions", fontsize=10, fontweight="bold")
     for bar, prob in zip(bars, ms["home_win_prob"]):
         ax4.text(bar.get_width()+0.005, bar.get_y()+bar.get_height()/2,
@@ -487,11 +286,18 @@ def create_full_dashboard(rankings, disparity, matchups, cal_data, output_dir):
 # ═══════════════════════ REPORT ═════════════════════════════════════
 
 def write_submission_report(rankings, matchups, disparity, a, b,
-                            train_acc, cv_acc, cv_std, cv_ll, cv_brier,
-                            base_acc, base_ll, base_brier, base_home_rate,
-                            cal_data, output_dir):
+                            metrics, cal_data, output_dir, ot_weight=0.5):
     home_adv = expit(a)
     d10 = disparity.nlargest(10, "adj_ratio")
+    train_acc = metrics.train_acc
+    cv_acc = metrics.cv_acc
+    cv_std = metrics.cv_std
+    cv_ll = metrics.cv_ll
+    cv_brier = metrics.cv_brier
+    base_acc = metrics.base_acc
+    base_ll = metrics.base_ll
+    base_brier = metrics.base_brier
+    base_home_rate = metrics.base_home_rate
 
     txt = f"""# WHSDSC 2026 Phase 1 — Submission Report
 
@@ -503,7 +309,7 @@ def write_submission_report(rankings, matchups, disparity, a, b,
 We validated 25,827 line-level records across 1,312 games (32 teams), confirming zero missing values. We aggregated line-level rows to game-level outcomes and stacked home/away records symmetrically for unbiased team statistics. For line-disparity analysis we restricted to first/second offensive lines vs first/second defensive pairings (excluding PP/PK and empty-net segments). Overtime games were flagged for special handling in our strength model.
 
 ### Additional Variables (~25 words)
-Engineered: xG differential per 60 min, xG share, OT-aware Bradley-Terry strength, strength of schedule, adjusted line xG/60 (controlling for defensive matchup difficulty), GSAx per game (goaltender quality above expected), xG per shot (offensive chance quality), PIM per game and penalty differential (team discipline).
+Engineered: xG differential per 60 min, xG share, OT-aware Bradley-Terry strength, strength of schedule, adjusted line xG/60 (controlling for defensive matchup difficulty), GSAx per game (goaltender quality above expected), xG per shot (offensive chance quality), PIM per game and penalty differential (team discipline), special teams rates (PP xGF/60, PK xGA/60), even-strength xGD/60, finishing and goalsaving with Bayesian shrinkage, line depth gap, goalie starter analysis with shrinkage, high-danger chance frequency.
 
 ---
 
@@ -513,7 +319,7 @@ Engineered: xG differential per 60 min, xG share, OT-aware Bradley-Terry strengt
 Python (pandas, numpy, scipy, matplotlib, scikit-learn, xgboost). Bradley-Terry fitted via iterative MLE with OT-downweighting. Logistic regression optimized via scipy. ML challengers (Elastic Net, XGBoost) were used as benchmarks; final submission uses the simpler BT-only model. Three AI assistants (Claude, Gemini, Codex) provided independent cross-validation and methodology critique.
 
 ### Statistical Methods (~100 words)
-Our approach rests on the **Bradley-Terry paired comparison model**, fitted via maximum likelihood on all 1,312 games. Overtime games receive half weight, since OT outcomes are near coin-flips (52.1% home win in OT vs 57.6% in regulation) and carry weaker signal about true team quality.
+Our approach rests on the **Bradley-Terry paired comparison model**, fitted via maximum likelihood on all 1,312 games. Overtime games receive reduced weight (tuned to {ot_weight} via nested CV), since OT outcomes are near coin-flips (52.1% home win in OT vs 57.6% in regulation) and carry weaker signal about true team quality.
 
 Win probabilities come from **calibrated logistic regression**: P(home_win) = sigmoid({a:.4f} + {b:.4f} × BT_strength_diff), with the intercept capturing {home_adv:.1%} home-ice advantage. We validated this via **5-fold cross-validation** (accuracy {cv_acc:.1%} ± {cv_std:.1%}, Brier {cv_brier:.4f}).
 
@@ -558,7 +364,9 @@ Three AI models collaborated: **Claude** (Anthropic) designed the analysis pipel
                 f"{r['bt_strength']:.4f} | {r['xgd_per60']:.4f} | "
                 f"{r['xg_share']:.3f} | {r['win_pct']:.3f} | {r['sos']:.4f} | "
                 f"{r['gsax_pg']:.3f} | {r['xg_per_shot']:.4f} | "
-                f"{r['pim_pg']:.1f} | {r['pen_diff_pg']:+.1f} |\n")
+                f"{r['pim_pg']:.1f} | {r['pen_diff_pg']:+.1f} | "
+                f"{r.get('ev_xgd60', 0):.4f} | {r.get('pp_xgf60', 0):.4f} | "
+                f"{r.get('pk_xga60', 0):.4f} | {r.get('goalie_gsax60', 0):.4f} |\n")
 
     txt += "\n### Round 1 Matchup Predictions\n\n"
     txt += "| Game | Home | Away | Home Win Prob | Predicted Winner |\n"
@@ -619,27 +427,53 @@ def main():
     print("[3/8] Team statistics...")
     stats = build_team_stats(game)
 
-    print("[4/8] OT-aware Bradley-Terry...")
-    bt = fit_bt_ot_aware(game, teams, ot_weight=0.5)
+    # Advanced record-level features
+    rec = stack_records(df)  # Pre-compute once
+    adv_st = build_special_teams(df, rec=rec)
+    adv_ld = build_line_depth(df, rec=rec)
+    adv_gk = build_goalie_features(df, rec=rec)
+    adv_hd = build_high_danger(df, rec=rec)
+    stats = stats.join(adv_st).join(adv_ld).join(adv_gk).join(adv_hd)
+
+    print("[3.5/8] Tuning BT hyperparameters (nested CV)...")
+    best_ot, best_reg, best_cal, tune_details = tune_bt_hyperparams(game, teams)
+    print(f"  Best: ot_weight={best_ot}, reg={best_reg}, cal={best_cal}")
+    print(f"  Inner Brier: {tune_details['best_brier']:.4f}")
+
+    print("[4/8] OT-aware Bradley-Terry (tuned params)...")
+    bt_kwargs = dict(ot_weight=best_ot, regularization=best_reg)
+    bt = fit_bt(game, teams, **bt_kwargs)
     sos = compute_sos(game, bt)
     top3 = sorted(bt.items(), key=lambda x: -x[1])[:3]
     print(f"  Top 3: {', '.join(f'{t}({s:.3f})' for t,s in top3)}")
 
+    # Bootstrap BT for uncertainty quantification
+    print("  Bootstrap (200 resamples)...")
+    bt_mean, bt_std, bt_ci, bt_samples = bootstrap_bt(
+        game, teams, n_boot=200, **bt_kwargs)
+
     print("[5/8] Ensemble rankings...")
     rankings = build_rankings(stats, bt, sos)
+    # Add bootstrap CI to rankings
+    rankings["bt_ci_lo"] = rankings["team"].map(lambda t: bt_ci[t][0])
+    rankings["bt_ci_hi"] = rankings["team"].map(lambda t: bt_ci[t][1])
+    rankings["bt_std"] = rankings["team"].map(bt_std)
     print(f"  #1 {rankings.iloc[0]['team']} ({rankings.iloc[0]['composite']:.3f})")
 
-    print("[6/8] Calibrated logistic + CV...")
+    print("[6/8] Calibrated logistic + CV (with tuned BT params)...")
     a, b, train_acc, train_ll, train_brier = fit_logistic(game, bt)
-    cv_acc, cv_std, cv_ll, cv_brier, base_acc, base_ll, base_brier, oof_pred, oof_true = cross_validate_bt(game, teams)
+    cv = cross_validate_bt(game, teams, bt_kwargs=bt_kwargs, n_boot=200)
     print(f"  a={a:.4f} (home-ice ~{expit(a):.1%}), b={b:.4f}")
     print(f"  Train: {train_acc:.1%} acc, {train_brier:.4f} Brier")
-    print(f"  CV:    {cv_acc:.1%}±{cv_std:.1%} acc, {cv_brier:.4f} Brier")
+    print(f"  CV:    {cv.acc:.1%}±{cv.acc_std:.1%} acc, {cv.brier:.4f} Brier")
 
     # Calibration data from out-of-fold (OOF) predictions for honesty.
-    p_all = np.asarray(oof_pred, dtype=float)
-    y_all = np.asarray(oof_true, dtype=int)
-    bins = np.linspace(0.3, 0.8, 7)
+    p_all = np.asarray(cv.oof_pred, dtype=float)
+    y_all = np.asarray(cv.oof_true, dtype=int)
+    # Dynamic calibration bins from prediction distribution
+    p_lo = max(0.0, np.percentile(p_all, 2) - 0.02)
+    p_hi = min(1.0, np.percentile(p_all, 98) + 0.02)
+    bins = np.linspace(p_lo, p_hi, 7)
     cal_data = []
     for i in range(len(bins)-1):
         mask = (p_all >= bins[i]) & (p_all < bins[i+1])
@@ -649,15 +483,28 @@ def main():
                              "obs": y_all[mask].mean(),
                              "n": int(mask.sum())})
 
+    # ECE and CV metric confidence intervals
+    ece = compute_ece(y_all, p_all)
+    print(f"  ECE:   {ece:.4f}")
+    cv_acc_ci = 1.96 * cv.acc_std / np.sqrt(CFG["cv"]["n_folds"])
+    print(f"  CV acc CI: {cv.acc:.1%} ± {cv_acc_ci:.1%}")
+
+    # Tune uncertainty shrink (using per-fold bootstrap uncertainties, not full-data bt_std)
+    shrink_k = tune_uncertainty_shrink_k(cv.oof_pred, cv.oof_true, cv.oof_uncertainties, game)
+    print(f"  Uncertainty shrink k: {shrink_k:.4f}")
+
     print("[7/8] Matchup predictions...")
-    mp = predict_matchups(matchups, bt, a, b)
+    mp = predict_matchups(matchups, bt, a, b,
+                          bt_samples=bt_samples, teams=teams,
+                          bt_std=bt_std, uncertainty_shrink_k=shrink_k)
 
     print("[8/8] Line disparity + outputs...")
     disp = build_line_disparity(df)
 
     # Save CSVs
     rc = ["rank","team","composite","bt_strength","xgd_per60","xg_share","gd_pg","win_pct","sos","pdo",
-           "gsax_pg","xg_per_shot","pim_pg","pen_diff_pg"]
+           "gsax_pg","xg_per_shot","pim_pg","pen_diff_pg",
+           "ev_xgd60","pp_xgf60","pk_xga60","goalie_gsax60","depth_gap","fin60_shrunk","gsax60_shrunk"]
     rankings[rc].to_csv(os.path.join(OUTPUT_DIR, "power_rankings.csv"), index=False)
     mp.to_csv(os.path.join(OUTPUT_DIR, "matchup_predictions.csv"), index=False)
     dc = ["team","first_raw","second_raw","raw_ratio","first_adj","second_adj","adj_ratio"]
@@ -668,10 +515,14 @@ def main():
     viz2 = create_full_dashboard(rankings, disp, mp, cal_data, OUTPUT_DIR)
 
     # Report
+    metrics = ReportMetrics(
+        train_acc=train_acc, cv_acc=cv.acc, cv_std=cv.acc_std,
+        cv_ll=cv.ll, cv_brier=cv.brier,
+        base_acc=cv.base_acc, base_ll=cv.base_ll, base_brier=cv.base_brier,
+        base_home_rate=y_all.mean(),
+    )
     rpt = write_submission_report(rankings, mp, disp, a, b,
-                                  train_acc, cv_acc, cv_std, cv_ll, cv_brier,
-                                  base_acc, base_ll, base_brier, y_all.mean(),
-                                  cal_data, OUTPUT_DIR)
+                                  metrics, cal_data, OUTPUT_DIR, ot_weight=best_ot)
 
     print("\n" + "=" * 60)
     print("SUBMISSION OUTPUTS (output/submission/)")
